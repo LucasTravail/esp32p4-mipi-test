@@ -39,9 +39,17 @@ dependencies:
     source:
       type: idf
     version: 5.5.5
+  lvgl/lvgl:
+    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 9.5.0
 direct_dependencies:
 - espressif/esp_tinyusb
 - idf
-manifest_hash: 2510bb150c79b9ac69499d12dccb64fe114091296021461bca553b5a755e43f7
+- lvgl/lvgl
+manifest_hash: fcb6a4b6d48f99eea25a041ed675bd723cee1552465b86dc59b171519f3acd10
 target: esp32p4
 version: 2.0.0

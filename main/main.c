@@ -361,7 +361,7 @@ static void anim_orbit_cb(void *var, int32_t deg)
     lv_obj_set_pos(s_ball, (int)(LCD_H / 2 + r * cosf(rad)) - 12, (int)(LCD_V / 2 + r * sinf(rad)) - 12);
 }
 
-static void ui_create(void)
+__attribute__((unused)) static void ui_create(void)
 {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -408,6 +408,282 @@ static void ui_create(void)
     lv_anim_start(&a);
 }
 
+// ---- Test pattern UI ("mire"): tap the screen to go to the next pattern ----------------
+#define UI_MIRE 1   // 1 = test pattern, 0 = the arc/ball demo (ui_create)
+enum { PAT_BARS, PAT_GRID, PAT_GRAY, PAT_RGB_GRAD, PAT_RED, PAT_GREEN, PAT_BLUE, PAT_WHITE, PAT_COUNT };
+static int s_pat;
+static lv_obj_t *s_mire;
+
+static lv_obj_t *rect(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t c)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(o, c, 0);
+    return o;
+}
+
+static void gradient(lv_obj_t *parent, int y, int h, lv_color_t c0, lv_color_t c1)
+{
+    lv_obj_t *o = rect(parent, 0, y, LCD_H, h, c0);
+    lv_obj_set_style_bg_grad_color(o, c1, 0);
+    lv_obj_set_style_bg_grad_dir(o, LV_GRAD_DIR_HOR, 0);
+}
+
+static void mire_build(void)
+{
+    lv_obj_clean(s_mire);
+    lv_obj_set_style_bg_color(s_mire, lv_color_black(), 0);
+    switch (s_pat) {
+    case PAT_BARS: {   // EBU-style bars: white yellow cyan green magenta red blue black
+        static const uint32_t cols[8] = { 0xFFFFFF, 0xFFFF00, 0x00FFFF, 0x00FF00, 0xFF00FF, 0xFF0000, 0x0000FF, 0x000000 };
+        for (int i = 0; i < 8; i++) {
+            int x0 = i * LCD_H / 8, x1 = (i + 1) * LCD_H / 8;
+            rect(s_mire, x0, 0, x1 - x0, LCD_V, lv_color_hex(cols[i]));
+        }
+        break;
+    }
+    case PAT_GRID: {   // 50 px grid, border circle, centre cross
+        for (int v = 0; v <= LCD_H; v += 50) {
+            rect(s_mire, v, 0, 1, LCD_V, lv_color_make(80, 80, 80));
+            rect(s_mire, 0, v, LCD_H, 1, lv_color_make(80, 80, 80));
+        }
+        rect(s_mire, LCD_H / 2 - 1, 0, 2, LCD_V, lv_color_white());
+        rect(s_mire, 0, LCD_V / 2 - 1, LCD_H, 2, lv_color_white());
+        lv_obj_t *c = lv_obj_create(s_mire);
+        lv_obj_remove_style_all(c);
+        lv_obj_set_size(c, LCD_H - 2, LCD_V - 2);
+        lv_obj_set_pos(c, 1, 1);
+        lv_obj_set_style_radius(c, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(c, 3, 0);
+        lv_obj_set_style_border_color(c, lv_color_make(255, 200, 0), 0);
+        lv_obj_set_style_bg_opa(c, LV_OPA_TRANSP, 0);
+        break;
+    }
+    case PAT_GRAY:     // black -> white gradient
+        gradient(s_mire, 0, LCD_V, lv_color_black(), lv_color_white());
+        break;
+    case PAT_RGB_GRAD: // one row per primary + white
+        gradient(s_mire, 0, LCD_V / 4, lv_color_black(), lv_color_make(255, 0, 0));
+        gradient(s_mire, LCD_V / 4, LCD_V / 4, lv_color_black(), lv_color_make(0, 255, 0));
+        gradient(s_mire, LCD_V / 2, LCD_V / 4, lv_color_black(), lv_color_make(0, 0, 255));
+        gradient(s_mire, 3 * LCD_V / 4, LCD_V / 4, lv_color_black(), lv_color_white());
+        break;
+    case PAT_RED:   rect(s_mire, 0, 0, LCD_H, LCD_V, lv_color_make(255, 0, 0)); break;
+    case PAT_GREEN: rect(s_mire, 0, 0, LCD_H, LCD_V, lv_color_make(0, 255, 0)); break;
+    case PAT_BLUE:  rect(s_mire, 0, 0, LCD_H, LCD_V, lv_color_make(0, 0, 255)); break;
+    case PAT_WHITE: rect(s_mire, 0, 0, LCD_H, LCD_V, lv_color_white()); break;
+    }
+    // pattern number, in a black pill near the top so it is readable on every pattern
+    lv_obj_t *pill = lv_obj_create(s_mire);
+    lv_obj_remove_style_all(pill);
+    lv_obj_set_size(pill, 120, 36);
+    lv_obj_align(pill, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_radius(pill, 18, 0);
+    lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(pill, lv_color_black(), 0);
+    lv_obj_t *l = lv_label_create(pill);
+    lv_label_set_text_fmt(l, "%d / %d", s_pat + 1, PAT_COUNT);
+    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_obj_center(l);
+}
+
+static void mire_click_cb(lv_event_t *e)
+{
+    s_pat = (s_pat + 1) % PAT_COUNT;
+    mire_build();
+}
+
+static void mire_create(void)
+{
+    s_mire = lv_screen_active();
+    lv_obj_remove_flag(s_mire, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_mire, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_mire, mire_click_cb, LV_EVENT_CLICKED, NULL);
+    mire_build();
+}
+
+// ---- Hardware test WITHOUT LVGL: touch arc gauge + orbiting ball --------------------
+// Everything is drawn analytically straight into the panel's GRAM (partial windows), the touch
+// controller is polled directly. If this works, display + touch hardware are fine.
+#define SKIP_TOUCH 1   // temporary: is the DSI hang caused by touch_init()?
+#define USE_LVGL 0   // 0 = no-LVGL hardware test, 1 = LVGL UI (mire / editor UI)
+
+#define ARC_R_IN   146
+#define ARC_R_OUT  170
+#define ARC_START  135.0f          // degrees, 0 = right, clockwise (y points down)
+#define ARC_SPAN   270.0f
+#define ORBIT_R    205
+#define BALL_RAD   12
+#define CX (LCD_H / 2)
+#define CY (LCD_V / 2)
+
+typedef struct { int value; int ball_x, ball_y; float knob_x, knob_y; } hw_state_t;
+
+static void hw_update_knob(hw_state_t *st)
+{
+    float ka = (ARC_START + ARC_SPAN * st->value / 100.0f) * 0.0174533f;
+    float mid = (ARC_R_IN + ARC_R_OUT) * 0.5f;
+    st->knob_x = CX + mid * cosf(ka);
+    st->knob_y = CY + mid * sinf(ka);
+}
+
+// 7-segment digit, 36 x 64 px, stroke 8: returns true if (x, y) (relative to the digit) is lit
+static bool seg_on(int d, int x, int y)
+{
+    static const uint8_t m[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };   // gfedcba
+    const int w = 36, h = 64, t = 8;
+    uint8_t g = m[d];
+    if (x < 0 || y < 0 || x >= w || y >= h) return false;
+    if ((g & 0x01) && y < t) return true;                               // a  top
+    if ((g & 0x08) && y >= h - t) return true;                          // d  bottom
+    if ((g & 0x40) && y >= h / 2 - t / 2 && y < h / 2 + t / 2) return true;   // g  middle
+    if ((g & 0x20) && x < t && y < h / 2) return true;                  // f  upper left
+    if ((g & 0x02) && x >= w - t && y < h / 2) return true;            // b  upper right
+    if ((g & 0x10) && x < t && y >= h / 2) return true;                // e  lower left
+    if ((g & 0x04) && x >= w - t && y >= h / 2) return true;           // c  lower right
+    return false;
+}
+
+static void colour_at(const hw_state_t *st, int x, int y, uint8_t *rgb)
+{
+    int r = 0, g = 0, b = 0;
+    int dx = x - CX, dy = y - CY;
+    int d2 = dx * dx + dy * dy;
+
+    // arc ring
+    if (d2 >= ARC_R_IN * ARC_R_IN && d2 <= ARC_R_OUT * ARC_R_OUT) {
+        float a = atan2f((float)dy, (float)dx) * 57.29578f - ARC_START;
+        while (a < 0) a += 360.0f;
+        if (a <= ARC_SPAN) {
+            if (a <= ARC_SPAN * st->value / 100.0f) { r = 0; g = 200; b = 255; }
+            else { r = g = b = 45; }
+        }
+    }
+    // knob at the end of the filled part (position precomputed in hw_update_knob)
+    {
+        float ex = x - st->knob_x, ey = y - st->knob_y;
+        if (ex * ex + ey * ey <= 14.0f * 14.0f) r = g = b = 255;
+    }
+    // value as 1..3 digits in the centre
+    if (dx > -80 && dx < 80 && dy > -34 && dy < 34) {
+        int v = st->value, digits = v >= 100 ? 3 : (v >= 10 ? 2 : 1);
+        int total = digits * 36 + (digits - 1) * 10, x0 = CX - total / 2, y0 = CY - 32;
+        for (int i = 0; i < digits; i++) {
+            int div = i == digits - 1 ? 1 : (digits - i == 3 ? 100 : 10);
+            int dig = (v / div) % 10;
+            if (seg_on(dig, x - (x0 + i * 46), y - y0)) r = g = b = 255;
+        }
+    }
+    // orbiting ball
+    {
+        int bx = x - st->ball_x, by = y - st->ball_y;
+        if (bx * bx + by * by <= BALL_RAD * BALL_RAD) { r = 255; g = b = 0; }
+    }
+    rgb[0] = r; rgb[1] = g; rgb[2] = b;
+}
+
+static volatile int g_pk, g_x, g_y, g_stage;
+static void monitor_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        cdc_log("mon: stage=%d pk=%d x=%d y=%d", g_stage, g_pk, g_x, g_y);
+    }
+}
+
+// Redraw the rectangle x0..x1 / y0..y1 (clipped, aligned on even coordinates as the chip requires).
+// The pixels are computed into a RAM buffer FIRST and then streamed to the panel back to back:
+// gaps between DSI packets (computing colours between packets) made the host stall after a few packets.
+static esp_err_t redraw(const hw_state_t *st, int x0, int y0, int x1, int y1)
+{
+    static uint8_t *fbuf;
+    if (!fbuf) fbuf = heap_caps_malloc(LCD_H * LCD_V * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!fbuf) return ESP_ERR_NO_MEM;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > LCD_H - 1) x1 = LCD_H - 1;
+    if (y1 > LCD_V - 1) y1 = LCD_V - 1;
+    x0 &= ~1; y0 &= ~1; x1 |= 1; y1 |= 1;
+
+    uint8_t *p = fbuf;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++, p += 3) colour_at(st, x, y, p);
+    }
+    int total = (x1 - x0 + 1) * (y1 - y0 + 1);
+
+    esp_err_t err = set_window(x0, y0, x1, y1);
+    const uint8_t *q = fbuf;
+    bool first = true;
+    while (total > 0 && err == ESP_OK) {
+        int n = total < CHUNK_PX ? total : CHUNK_PX;
+        err = esp_lcd_panel_io_tx_param(s_io, first ? 0x2C : 0x3C, q, n * 3);
+        first = false;
+        q += n * 3;
+        total -= n;
+    }
+    return err;
+}
+
+static void hw_test_run(void)
+{
+    hw_state_t st = { .value = 50, .ball_x = CX + ORBIT_R, .ball_y = CY };
+    hw_update_knob(&st);
+    TickType_t t0 = xTaskGetTickCount();
+    for (int y = 0; y < LCD_V; y += 58) {   // strips, timed, so a slow / stuck part shows up in the log
+        TickType_t ts = xTaskGetTickCount();
+        esp_err_t er = redraw(&st, 0, y, LCD_H - 1, y + 57);
+        cdc_log("strip y=%d: %s, %d ms", y, er == ESP_OK ? "ok" : esp_err_to_name(er), (int)((xTaskGetTickCount() - ts) * portTICK_PERIOD_MS));
+    }
+    cdc_log("first full redraw: %d ms", (int)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS));
+    cdc_log("hardware test (no LVGL): touch the arc to set the gauge, the red ball orbits");
+
+    int deg = 0;
+    TickType_t t_log = xTaskGetTickCount();
+    int frames = 0;
+    for (;;) {
+        // --- touch: the ring sets the value from the touch angle
+        touch_poll();
+        int new_val = st.value;
+        if (s_tpress) {
+            int dx = s_tx - CX, dy = s_ty - CY;
+            if (dx * dx + dy * dy > 60 * 60) {
+                float a = atan2f((float)dy, (float)dx) * 57.29578f - ARC_START;
+                while (a < 0) a += 360.0f;
+                if (a > ARC_SPAN) a = (a - ARC_SPAN < 360.0f - a) ? ARC_SPAN : 0.0f;   // dead zone: snap
+                new_val = (int)(a * 100.0f / ARC_SPAN + 0.5f);
+            }
+        }
+        // --- ball
+        deg = (deg + 4) % 360;
+        int nbx = CX + (int)(ORBIT_R * cosf(deg * 0.0174533f));
+        int nby = CY + (int)(ORBIT_R * sinf(deg * 0.0174533f));
+
+        esp_err_t e = ESP_OK;
+        int ox = st.ball_x, oy = st.ball_y;
+        st.ball_x = nbx; st.ball_y = nby;
+        int m = BALL_RAD + 4;
+        int bx0 = (ox < nbx ? ox : nbx) - m, bx1 = (ox > nbx ? ox : nbx) + m;
+        int by0 = (oy < nby ? oy : nby) - m, by1 = (oy > nby ? oy : nby) + m;
+        e = redraw(&st, bx0, by0, bx1, by1);
+        if (e == ESP_OK && new_val != st.value) {
+            st.value = new_val;
+            hw_update_knob(&st);
+            e = redraw(&st, CX - ARC_R_OUT - 16, CY - ARC_R_OUT - 16, CX + ARC_R_OUT + 16, CY + ARC_R_OUT + 16);
+        }
+        if (e != ESP_OK) { cdc_log("draw error: %s", esp_err_to_name(e)); vTaskDelay(pdMS_TO_TICKS(500)); }
+        frames++;
+        if (xTaskGetTickCount() - t_log >= pdMS_TO_TICKS(5000)) {
+            cdc_log("value=%d touch=%d (%d,%d) %d frames in 5 s", st.value, (int)s_tpress, s_tx, s_ty, frames);
+            frames = 0;
+            t_log = xTaskGetTickCount();
+        }
+        vTaskDelay(1);
+    }
+}
+
 void app_main(void)
 {
     gpio_config_t led = { .pin_bit_mask = 1ULL << PIN_LED, .mode = GPIO_MODE_OUTPUT };
@@ -436,6 +712,13 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
+#if !USE_LVGL
+#ifndef SKIP_TOUCH
+    touch_init();
+#endif
+    hw_test_run();   // never returns
+    return;
+#endif
     lv_init();
     lv_tick_set_cb(lvgl_tick_cb);
     lv_display_t *disp = lv_display_create(LCD_H, LCD_V);
@@ -457,7 +740,11 @@ void app_main(void)
     esp32p4_ui_init("");
     lv_screen_load(main_screen_create());
 #else
-    ui_create();   // built-in demo UI
+#if UI_MIRE
+    mire_create();   // built-in test pattern, tap to change
+#else
+    ui_create();     // built-in arc / ball demo
+#endif
 #endif
     xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 4, NULL);
     cdc_log("LVGL %d.%d.%d running", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
