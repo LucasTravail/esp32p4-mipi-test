@@ -1,9 +1,18 @@
-# ESP32-P4 MIPI hardware test pattern (ESP-IDF 5.5.5)
+# ESP32-P4 MIPI test: red / green / blue full-screen (ESP-IDF 5.5.5)
 
-Vertical colour bars from the P4 MIPI-DSI **hardware pattern generator** on a CH13613 / TT151AMC82C 466x466 panel
-(1 lane, 250 Mbps, DPI 6 MHz). USB: TinyUSB CDC ACM; a **1200 baud** line-coding request reboots into the ROM loader.
-Logs on UART0 (GPIO37/38, 115200). MIPI PHY (2.5 V) and panel VBAT are external: no internal LDO is configured.
-Config is not fully validated: rare residual glitches were seen under Arduino.
+CH13613 / TT151AMC82C 466x466 AMOLED, 1 lane, 250 Mbps. The firmware shows red, green, blue, white, black
+in a loop (1.5 s each) by writing the panel's own GRAM in **DSI command mode**: DCS RAMW (0x2C) then
+RAMWC (0x3C), 40 px per packet, **sent in HS** (`cmd_mode_cfg.dcs_lw_tx = 0`). A full screen takes ~90 ms.
+USB: TinyUSB CDC ACM; a **1200 baud** line-coding request reboots into the ROM loader.
+Logs go to the USB CDC port (and UART0 GPIO37/38, 115200). MIPI PHY (2.5 V) and panel VBAT are external.
+
+Things learnt on this hardware (do not rediscover them):
+- The IDF DPI video path (`esp_lcd_new_panel_dpi`) streams exactly ONE frame and then stalls (bridge FIFO stays
+  full, host reports `dpi_buff_pld_under`): not used. The host pattern generator (bars) does work.
+- The panel stays black until the power IC for ELVDD/ELVSS is enabled: write `0x6C = 0xA5` (SWIRE manual).
+- RAMW/RAMWC must be sent in HS (datasheet): in LP the writes are silently ignored.
+- The IDF DCS long-write helper fills the payload FIFO before the header: keep packets small (<= ~120 bytes).
+- ALLPOFF (0x22) is NOT left by NORON (0x13): do not use it for tests, hardware-reset the panel instead.
 
 ## Build
 ESP-IDF terminal (or VS Code: ESP-IDF: Build):
