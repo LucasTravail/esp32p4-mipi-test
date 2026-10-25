@@ -236,8 +236,9 @@ static void touch_init(void)
     i2c_master_bus_handle_t bus = NULL;
     char found[120];
     int addr_found = -1;
-    for (int attempt = 0; attempt < 2 && addr_found < 0; attempt++) {
-        const gpio_num_t sda = attempt ? PIN_TP_SCL : PIN_TP_SDA, scl = attempt ? PIN_TP_SDA : PIN_TP_SCL;
+    bool quick = true;   // first try only the expected address, scan the whole bus only if it fails
+    for (int attempt = 0; attempt < 3 && addr_found < 0; attempt++) {
+        const gpio_num_t sda = attempt == 1 ? PIN_TP_SCL : PIN_TP_SDA, scl = attempt == 1 ? PIN_TP_SDA : PIN_TP_SCL;
         const i2c_master_bus_config_t bus_cfg = {
             .i2c_port = I2C_NUM_0,
             .sda_io_num = sda,
@@ -248,11 +249,11 @@ static void touch_init(void)
         };
         if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) { cdc_log("touch: I2C bus init failed"); return; }
         int n = snprintf(found, sizeof(found), "touch: scan (SDA=%d SCL=%d):", (int)sda, (int)scl);
-        for (int a = 0x08; a < 0x78; a++) {
+        for (int a = quick ? TP_ADDR : 0x08; a < (quick ? TP_ADDR + 1 : 0x78); a++) {
             if (i2c_master_probe(bus, a, 20) == ESP_OK) { n += snprintf(found + n, sizeof(found) - n, " 0x%02X", a); if (addr_found < 0) addr_found = a; }
         }
         cdc_log("%s", found);
-        if (addr_found < 0) { i2c_del_master_bus(bus); bus = NULL; }
+        if (addr_found < 0) { i2c_del_master_bus(bus); bus = NULL; quick = false; }
     }
     if (addr_found < 0) { cdc_log("touch: nothing answers on the I2C bus (touch disabled)"); return; }
 
@@ -265,6 +266,8 @@ static void touch_init(void)
 }
 
 static volatile int s_tx, s_ty;
+static volatile int s_tp_polls, s_tp_valid, s_tp_err;
+static volatile uint8_t s_tp_raw[7];
 static volatile bool s_tpress;
 
 // Returns true when a valid frame was read. Frame layout (CST92xx family):
@@ -273,9 +276,17 @@ static volatile bool s_tpress;
 static bool touch_poll(void)
 {
     uint8_t b[16] = {0};
-    if (!s_tp_ok || tp_read(0xD000, b, sizeof(b)) != ESP_OK) return false;
+    // INT is only a short pulse (missed by polling), and the chip returns 0xFF when read too often: poll every 30 ms.
+    static TickType_t last;
+    TickType_t now = xTaskGetTickCount();
+    if (now - last < pdMS_TO_TICKS(30)) return false;
+    last = now;
+    s_tp_polls++;
+    if (!s_tp_ok || tp_read(0xD000, b, sizeof(b)) != ESP_OK) { s_tp_err++; return false; }
+    for (int i = 0; i < 7; i++) s_tp_raw[i] = b[i];
     bool valid = (b[6] == 0xAB) && (b[0] != 0xAB);
     if (valid) {
+        s_tp_valid++;
         int count = b[5] & 0x7F;
         bool down = count > 0 && (b[0] & 0x0F) == 0x06;
         if (down) {
@@ -508,7 +519,6 @@ static void mire_create(void)
 // ---- Hardware test WITHOUT LVGL: touch arc gauge + orbiting ball --------------------
 // Everything is drawn analytically straight into the panel's GRAM (partial windows), the touch
 // controller is polled directly. If this works, display + touch hardware are fine.
-#define SKIP_TOUCH 1   // temporary: is the DSI hang caused by touch_init()?
 #define USE_LVGL 0   // 0 = no-LVGL hardware test, 1 = LVGL UI (mire / editor UI)
 
 #define ARC_R_IN   146
@@ -676,7 +686,7 @@ static void hw_test_run(void)
         if (e != ESP_OK) { cdc_log("draw error: %s", esp_err_to_name(e)); vTaskDelay(pdMS_TO_TICKS(500)); }
         frames++;
         if (xTaskGetTickCount() - t_log >= pdMS_TO_TICKS(5000)) {
-            cdc_log("value=%d touch=%d (%d,%d) %d frames in 5 s", st.value, (int)s_tpress, s_tx, s_ty, frames);
+            cdc_log("value=%d touch=%d (%d,%d) %d frames | tp_ok=%d polls=%d valid=%d err=%d raw=%02X %02X %02X %02X %02X %02X %02X INT=%d", st.value, (int)s_tpress, s_tx, s_ty, frames, (int)s_tp_ok, s_tp_polls, s_tp_valid, s_tp_err, s_tp_raw[0], s_tp_raw[1], s_tp_raw[2], s_tp_raw[3], s_tp_raw[4], s_tp_raw[5], s_tp_raw[6], gpio_get_level(PIN_TP_INT));
             frames = 0;
             t_log = xTaskGetTickCount();
         }
@@ -712,10 +722,13 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
-#if !USE_LVGL
-#ifndef SKIP_TOUCH
+    // The touch controller is only powered/usable once the panel power is on, so it is brought up after
+    // the LCD. Keep this short (quick probe of 0x5A only): a multi-second bring-up between the LCD init
+    // and the first drawing made the DSI host stall.
+    vTaskDelay(pdMS_TO_TICKS(1000));   // let the panel-side supplies settle before resetting the touch chip
     touch_init();
-#endif
+
+#if !USE_LVGL
     hw_test_run();   // never returns
     return;
 #endif
@@ -730,7 +743,6 @@ void app_main(void)
     lv_display_set_flush_cb(disp, lvgl_flush_cb);
     lv_display_add_event_cb(disp, lvgl_round_cb, LV_EVENT_INVALIDATE_AREA, NULL);
 
-    touch_init();
     lv_indev_t *indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, touch_read_cb);
