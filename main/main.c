@@ -30,7 +30,7 @@ static const char *TAG = "p4_mipi";
 #define PIN_LCD_RESET  GPIO_NUM_14   // active low
 #define PIN_LED        GPIO_NUM_21
 
-#define PIN_TP_SDA     GPIO_NUM_6    // I2C_SDA (external 10k pull-up)
+#define PIN_TP_SDA     GPIO_NUM_7    // I2C_SDA (external 10k pull-up)
 #define PIN_TP_SCL     GPIO_NUM_5    // I2C_SCL (external 10k pull-up)
 #define PIN_TP_RST     GPIO_NUM_3    // TP_RST, active low
 #define PIN_TP_INT     GPIO_NUM_12   // TP_INT, active low
