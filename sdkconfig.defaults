@@ -28,3 +28,5 @@ CONFIG_LV_USE_OS_NONE=y
 
 # app_main draws analytically (floats, snprintf): the default 3584 B main stack is too small
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_LV_USE_OBJ_NAME=y   # needed by the code exported from the LVGL Pro Editor (lv_obj_set_name_static)
+CONFIG_LV_USE_TRANSLATION=y

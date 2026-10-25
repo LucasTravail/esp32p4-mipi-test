@@ -25,6 +25,7 @@
 #include "lvgl.h"
 #if __has_include("esp32p4_ui.h")
 #include "esp32p4_ui.h"
+#define UI_START_SCREEN_CREATE screen1_create   // screens/screen1.xml of the LVGL Pro project
 #endif
 
 static const char *TAG = "p4_mipi";
@@ -519,7 +520,7 @@ static void mire_create(void)
 // ---- Hardware test WITHOUT LVGL: touch arc gauge + orbiting ball --------------------
 // Everything is drawn analytically straight into the panel's GRAM (partial windows), the touch
 // controller is polled directly. If this works, display + touch hardware are fine.
-#define USE_LVGL 0   // 0 = no-LVGL hardware test, 1 = LVGL UI (mire / editor UI)
+#define USE_LVGL 1   // 0 = no-LVGL hardware test, 1 = LVGL UI (mire / editor UI)
 
 #define ARC_R_IN   146
 #define ARC_R_OUT  170
@@ -748,9 +749,9 @@ void app_main(void)
     lv_indev_set_read_cb(indev, touch_read_cb);
 
 #if __has_include("esp32p4_ui.h")
-    // UI exported by the LVGL Pro Editor from ../ui (project name esp32p4_ui, start screen main_screen)
+    // UI exported by the LVGL Pro Editor from ../ui/esp32p4_ui (start screen: screens/screen1.xml)
     esp32p4_ui_init("");
-    lv_screen_load(main_screen_create());
+    lv_screen_load(UI_START_SCREEN_CREATE());
 #else
 #if UI_MIRE
     mire_create();   // built-in test pattern, tap to change

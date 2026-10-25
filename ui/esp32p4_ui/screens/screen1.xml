@@ -1,0 +1,65 @@
+<screen>
+	<view
+		extends="lv_obj"
+		width="466"
+		height="466"
+		scrollable="false"
+		style_bg_color="0x000000"
+		style_bg_opa="100%"
+		style_border_width="0"
+		style_pad_all="0"
+		style_radius="0"
+	>
+		<!-- touch gauge: drag your finger on the ring -->
+		<lv_arc
+			width="340"
+			height="340"
+			align="center"
+			rotation="135"
+			bg_start_angle="0"
+			bg_end_angle="270"
+			min_value="0"
+			max_value="100"
+			value="40"
+			style_arc_width="24"
+			style_arc_width-indicator="24"
+			style_arc_color="0x2d2d2d"
+			style_arc_color-indicator="0x00c8ff"
+			style_bg_color-knob="0xffffff"
+		/>
+
+		<lv_label
+			text="LVGL Pro"
+			align="center"
+			y="-20"
+			style_text_color="0xffffff"
+		/>
+		<lv_label text="ESP32-P4 test" align="center" y="20" style_text_color="0x171515" />
+
+		<!-- red dot at the top of the display -->
+		<lv_obj
+			width="26"
+			height="26"
+			align="top_mid"
+			y="40"
+			scrollable="false"
+			style_radius="13"
+			style_bg_color="0xff0000"
+			style_bg_opa="100%"
+			style_border_width="0"
+		/>
+
+		<!-- button at the bottom -->
+		<lv_button
+			width="150"
+			height="52"
+			align="bottom_mid"
+			y="-34"
+			style_radius="26"
+			style_bg_color="0x00a0d0"
+			style_bg_color-pressed="0xff6000"
+		>
+			<lv_label text="Touch me" align="center" style_text_color="0xffffff" />
+		</lv_button>
+	</view>
+</screen>

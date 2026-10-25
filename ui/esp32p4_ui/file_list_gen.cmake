@@ -1,0 +1,6 @@
+list(
+  APPEND
+  LV_EDITOR_PROJECT_SOURCES
+  ${CMAKE_CURRENT_LIST_DIR}/esp32p4_ui_gen.c
+  ${CMAKE_CURRENT_LIST_DIR}/esp32p4_ui.c
+  ${CMAKE_CURRENT_LIST_DIR}/screens/screen1_gen.c)

@@ -5,6 +5,9 @@
 set(UI_DIR ${CMAKE_CURRENT_LIST_DIR}/../ui)
 file(GLOB_RECURSE UI_SRCS ${UI_DIR}/*.c)
 file(GLOB_RECURSE UI_HDRS ${UI_DIR}/*.h)
+# the editor project also contains a PC simulator and build folders: not part of the firmware
+list(FILTER UI_SRCS EXCLUDE REGEX "/(sim|build|preview-build)/")
+list(FILTER UI_HDRS EXCLUDE REGEX "/(sim|build|preview-build)/")
 set(UI_INCLUDE_DIRS "")
 foreach(h ${UI_HDRS})
     get_filename_component(d ${h} DIRECTORY)
