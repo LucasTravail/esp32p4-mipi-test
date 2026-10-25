@@ -19,12 +19,22 @@
 #include "soc/soc.h"
 #include "soc/lp_system_reg.h"
 #include "soc/mipi_dsi_host_struct.h"
+#include "esp_heap_caps.h"
+#include "driver/i2c_master.h"
+#include "esp_rom_sys.h"
+#include "lvgl.h"
 
 static const char *TAG = "p4_mipi";
 
 #define PIN_LCD_ENABLE GPIO_NUM_15   // VCI_EN, active high
 #define PIN_LCD_RESET  GPIO_NUM_14   // active low
 #define PIN_LED        GPIO_NUM_21
+
+#define PIN_TP_SDA     GPIO_NUM_6    // I2C_SDA (external 10k pull-up)
+#define PIN_TP_SCL     GPIO_NUM_5    // I2C_SCL (external 10k pull-up)
+#define PIN_TP_RST     GPIO_NUM_3    // TP_RST, active low
+#define PIN_TP_INT     GPIO_NUM_12   // TP_INT, active low
+#define TP_ADDR        0x5A          // CST9217: 8-bit address 0xB4/0xB5
 
 #define LCD_H 466
 #define LCD_V 466
@@ -164,65 +174,235 @@ static esp_err_t set_window(int x0, int y0, int x1, int y1)
     return err;
 }
 
-typedef void (*pixel_fn)(int x, int y, uint8_t *rgb, void *ctx);
+// ---- Touch: Hynitron CST9217 over I2C -----------------------------------------------
+static i2c_master_dev_handle_t s_tp;
+static bool s_tp_ok;
 
-// Write the window x0..x1 / y0..y1 (inclusive) pixel by pixel through fn().
-static esp_err_t draw_window(int x0, int y0, int x1, int y1, pixel_fn fn, void *ctx)
+// The CST9217 uses 16-bit register addresses (big endian).
+static esp_err_t tp_read(uint16_t reg, uint8_t *data, size_t len)
 {
-    esp_err_t err = set_window(x0, y0, x1, y1);
-    static uint8_t buf[CHUNK_PX * 3];
-    int n = 0;
-    bool first = true;
-    for (int y = y0; y <= y1 && err == ESP_OK; y++) {
-        for (int x = x0; x <= x1 && err == ESP_OK; x++) {
-            fn(x, y, &buf[3 * n], ctx);
-            if (++n == CHUNK_PX) {
-                err = esp_lcd_panel_io_tx_param(s_io, first ? 0x2C : 0x3C, buf, n * 3);
-                first = false;
-                n = 0;
-            }
-        }
+    const uint8_t a[2] = { reg >> 8, reg & 0xFF };
+    return i2c_master_transmit_receive(s_tp, a, 2, data, len, 50);
+}
+
+static esp_err_t tp_write(uint16_t reg, uint8_t val)
+{
+    const uint8_t a[3] = { reg >> 8, reg & 0xFF, val };
+    return i2c_master_transmit(s_tp, a, 3, 50);
+}
+
+static void touch_init(void)
+{
+    // hardware reset
+    gpio_config_t rst = { .pin_bit_mask = 1ULL << PIN_TP_RST, .mode = GPIO_MODE_OUTPUT };
+    gpio_config(&rst);
+    gpio_config_t irq = { .pin_bit_mask = 1ULL << PIN_TP_INT, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE };
+    gpio_config(&irq);
+    gpio_set_level(PIN_TP_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    {
+        gpio_config_t in0 = { .pin_bit_mask = (1ULL << PIN_TP_SDA) | (1ULL << PIN_TP_SCL), .mode = GPIO_MODE_INPUT };
+        gpio_config(&in0);
+        cdc_log("touch: levels while TP_RST is LOW: SDA=%d SCL=%d INT=%d", gpio_get_level(PIN_TP_SDA), gpio_get_level(PIN_TP_SCL), gpio_get_level(PIN_TP_INT));
     }
-    if (err == ESP_OK && n) err = esp_lcd_panel_io_tx_param(s_io, first ? 0x2C : 0x3C, buf, n * 3);
-    return err;
+    gpio_set_level(PIN_TP_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(150));   // chip re-initialisation time (datasheet: 100 ms)
+
+    // idle levels of the lines (external pull-ups should give 1/1/1)
+    gpio_config_t in = { .pin_bit_mask = (1ULL << PIN_TP_SDA) | (1ULL << PIN_TP_SCL), .mode = GPIO_MODE_INPUT };
+    gpio_config(&in);
+    cdc_log("touch: idle levels SDA=%d SCL=%d INT=%d", gpio_get_level(PIN_TP_SDA), gpio_get_level(PIN_TP_SCL), gpio_get_level(PIN_TP_INT));
+
+    // SDA stuck low? Try the standard I2C bus recovery: up to 9 clock pulses on SCL, then a STOP.
+    if (gpio_get_level(PIN_TP_SDA) == 0) {
+        gpio_config_t od = { .pin_bit_mask = (1ULL << PIN_TP_SDA) | (1ULL << PIN_TP_SCL), .mode = GPIO_MODE_INPUT_OUTPUT_OD, .pull_up_en = GPIO_PULLUP_ENABLE };
+        gpio_config(&od);
+        gpio_set_level(PIN_TP_SDA, 1);
+        for (int i = 0; i < 9 && gpio_get_level(PIN_TP_SDA) == 0; i++) {
+            gpio_set_level(PIN_TP_SCL, 0); esp_rom_delay_us(10);
+            gpio_set_level(PIN_TP_SCL, 1); esp_rom_delay_us(10);
+        }
+        gpio_set_level(PIN_TP_SDA, 0); esp_rom_delay_us(10);   // STOP = SDA rises while SCL is high
+        gpio_set_level(PIN_TP_SCL, 1); esp_rom_delay_us(10);
+        gpio_set_level(PIN_TP_SDA, 1); esp_rom_delay_us(10);
+        cdc_log("touch: after bus recovery SDA=%d SCL=%d", gpio_get_level(PIN_TP_SDA), gpio_get_level(PIN_TP_SCL));
+        gpio_reset_pin(PIN_TP_SDA);
+        gpio_reset_pin(PIN_TP_SCL);
+    }
+
+    i2c_master_bus_handle_t bus = NULL;
+    char found[120];
+    int addr_found = -1;
+    for (int attempt = 0; attempt < 2 && addr_found < 0; attempt++) {
+        const gpio_num_t sda = attempt ? PIN_TP_SCL : PIN_TP_SDA, scl = attempt ? PIN_TP_SDA : PIN_TP_SCL;
+        const i2c_master_bus_config_t bus_cfg = {
+            .i2c_port = I2C_NUM_0,
+            .sda_io_num = sda,
+            .scl_io_num = scl,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) { cdc_log("touch: I2C bus init failed"); return; }
+        int n = snprintf(found, sizeof(found), "touch: scan (SDA=%d SCL=%d):", (int)sda, (int)scl);
+        for (int a = 0x08; a < 0x78; a++) {
+            if (i2c_master_probe(bus, a, 20) == ESP_OK) { n += snprintf(found + n, sizeof(found) - n, " 0x%02X", a); if (addr_found < 0) addr_found = a; }
+        }
+        cdc_log("%s", found);
+        if (addr_found < 0) { i2c_del_master_bus(bus); bus = NULL; }
+    }
+    if (addr_found < 0) { cdc_log("touch: nothing answers on the I2C bus (touch disabled)"); return; }
+
+    const i2c_device_config_t dev_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = addr_found, .scl_speed_hz = 400000 };
+    if (i2c_master_bus_add_device(bus, &dev_cfg, &s_tp) != ESP_OK) { cdc_log("touch: add device failed"); return; }
+    uint8_t id[4] = {0};
+    esp_err_t e = tp_read(0xD204, id, sizeof(id));
+    cdc_log("touch: chip id read (0xD204) %s: %02X %02X %02X %02X", e == ESP_OK ? "ok" : esp_err_to_name(e), id[0], id[1], id[2], id[3]);
+    s_tp_ok = (e == ESP_OK);
 }
 
-static void px_black(int x, int y, uint8_t *rgb, void *ctx) { rgb[0] = rgb[1] = rgb[2] = 0; }
+static volatile int s_tx, s_ty;
+static volatile bool s_tpress;
 
-// ---- Bouncing ball -------------------------------------------------------------
-#define BALL_R   22
-#define ERASE_MARGIN 4   // the redrawn box is bigger than old+new ball, so nothing of the old image stays
-#define SCREEN_R 233   // the panel is round: 466 / 2
-
-typedef struct { int cx, cy; } ball_t;
-
-static void px_ball(int x, int y, uint8_t *rgb, void *ctx)
+// Returns true when a valid frame was read. Frame layout (CST92xx family):
+//   buf[0..4] first point: [id<<4 | status][x hi][y hi][x lo<<4 | y lo][pressure]
+//   buf[5] = point count (& 0x7F), buf[6] = 0xAB when the frame is valid; ack by writing 0xAB to 0xD000.
+static bool touch_poll(void)
 {
-    const ball_t *b = ctx;
-    int dx = x - b->cx, dy = y - b->cy;
-    bool inside = dx * dx + dy * dy <= BALL_R * BALL_R;
-    rgb[0] = inside ? 255 : 0;   // solid red ball on a black background
-    rgb[1] = 0;
-    rgb[2] = 0;
+    uint8_t b[16] = {0};
+    if (!s_tp_ok || tp_read(0xD000, b, sizeof(b)) != ESP_OK) return false;
+    bool valid = (b[6] == 0xAB) && (b[0] != 0xAB);
+    if (valid) {
+        int count = b[5] & 0x7F;
+        bool down = count > 0 && (b[0] & 0x0F) == 0x06;
+        if (down) {
+            s_tx = (b[1] << 4) | (b[3] >> 4);
+            s_ty = (b[2] << 4) | (b[3] & 0x0F);
+        }
+        if (down != s_tpress) cdc_log("touch %s x=%d y=%d  raw=%02X %02X %02X %02X %02X %02X %02X", down ? "DOWN" : "UP  ", s_tx, s_ty,
+                                      b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
+        s_tpress = down;
+    }
+    if (b[6] == 0xAB || valid) tp_write(0xD000, 0xAB);   // acknowledge
+    return valid;
 }
 
-static esp_err_t draw_ball(const ball_t *old, const ball_t *cur)
+static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
-    int x0 = (old->cx < cur->cx ? old->cx : cur->cx) - BALL_R - ERASE_MARGIN;
-    int x1 = (old->cx > cur->cx ? old->cx : cur->cx) + BALL_R + ERASE_MARGIN;
-    int y0 = (old->cy < cur->cy ? old->cy : cur->cy) - BALL_R - ERASE_MARGIN;
-    int y1 = (old->cy > cur->cy ? old->cy : cur->cy) + BALL_R + ERASE_MARGIN;
-    // clip, and keep an even start column and an even width (partial-update restriction of the chip)
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > LCD_H - 1) x1 = LCD_H - 1;
-    if (y1 > LCD_V - 1) y1 = LCD_V - 1;
-    // datasheet (CASET/RASET): for partial updates the start and the size must be even, in X AND in Y
-    x0 &= ~1;
-    x1 |= 1;
-    y0 &= ~1;
-    y1 |= 1;
-    return draw_window(x0, y0, x1, y1, px_ball, (void *)cur);
+    touch_poll();
+    data->point.x = s_tx;
+    data->point.y = s_ty;
+    data->state = s_tpress ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
+// ---- LVGL ----------------------------------------------------------------------
+// Partial rendering: LVGL draws into two small internal-RAM buffers and flush_cb sends each dirty
+// rectangle into the panel's GRAM (DCS RAMW/RAMWC in HS). The panel needs even-aligned windows.
+#define DRAW_LINES 40
+#define LVGL_BUF_BYTES (LCD_H * DRAW_LINES * 3)
+
+static void lvgl_round_cb(lv_event_t *e)
+{
+    lv_area_t *a = lv_event_get_param(e);   // LV_EVENT_INVALIDATE_AREA passes the area
+    a->x1 &= ~1;           // even first column / row, odd last one => even width / height
+    a->y1 &= ~1;
+    a->x2 |= 1;
+    a->y2 |= 1;
+    if (a->x2 > LCD_H - 1) a->x2 = LCD_H - 1;
+    if (a->y2 > LCD_V - 1) a->y2 = LCD_V - 1;
+}
+
+static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+{
+    static uint8_t buf[CHUNK_PX * 3];
+    esp_err_t err = set_window(area->x1, area->y1, area->x2, area->y2);
+    int total = (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
+    bool first = true;
+    while (total > 0 && err == ESP_OK) {
+        int n = total < CHUNK_PX ? total : CHUNK_PX;
+        for (int i = 0; i < n; i++) {   // LVGL RGB888 is B,G,R in memory; the panel wants R,G,B
+            buf[3 * i + 0] = px_map[3 * i + 2];
+            buf[3 * i + 1] = px_map[3 * i + 1];
+            buf[3 * i + 2] = px_map[3 * i + 0];
+        }
+        err = esp_lcd_panel_io_tx_param(s_io, first ? 0x2C : 0x3C, buf, n * 3);
+        first = false;
+        px_map += n * 3;
+        total -= n;
+    }
+    if (err != ESP_OK) ESP_LOGE(TAG, "flush failed: %s", esp_err_to_name(err));
+    lv_display_flush_ready(disp);
+}
+
+static uint32_t lvgl_tick_cb(void) { return xTaskGetTickCount() * portTICK_PERIOD_MS; }
+
+static void lvgl_task(void *arg)
+{
+    for (;;) {
+        uint32_t wait_ms = lv_timer_handler();
+        vTaskDelay(pdMS_TO_TICKS(wait_ms < 10 ? 10 : (wait_ms > 100 ? 100 : wait_ms)));
+    }
+}
+
+// ---- Demo UI: arc gauge + percentage + a red ball orbiting the edge -----------------
+static lv_obj_t *s_arc, *s_label, *s_ball;
+
+static void arc_changed_cb(lv_event_t *e)
+{
+    lv_label_set_text_fmt(s_label, "%d%%", (int)lv_arc_get_value(s_arc));
+}
+
+static void anim_orbit_cb(void *var, int32_t deg)
+{
+    const float r = 205.0f, rad = deg * 3.14159265f / 180.0f;
+    lv_obj_set_pos(s_ball, (int)(LCD_H / 2 + r * cosf(rad)) - 12, (int)(LCD_V / 2 + r * sinf(rad)) - 12);
+}
+
+static void ui_create(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_arc = lv_arc_create(scr);
+    lv_obj_set_size(s_arc, 340, 340);
+    lv_obj_center(s_arc);
+    lv_arc_set_rotation(s_arc, 135);
+    lv_arc_set_bg_angles(s_arc, 0, 270);
+    lv_arc_set_range(s_arc, 0, 100);
+    lv_obj_set_style_bg_color(s_arc, lv_color_white(), LV_PART_KNOB);   // draggable with the finger
+    lv_obj_add_event_cb(s_arc, arc_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_arc_set_value(s_arc, 50);
+    lv_obj_set_style_arc_width(s_arc, 24, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_arc, 24, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_arc, lv_color_make(40, 40, 40), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_arc, lv_color_make(0, 200, 255), LV_PART_INDICATOR);
+
+    s_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_label, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_label, lv_color_white(), 0);
+    lv_obj_center(s_label);
+    lv_label_set_text(s_label, "50%");
+
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "ESP32-P4  LVGL");
+    lv_obj_set_style_text_color(title, lv_color_make(160, 160, 160), 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 50);
+
+    s_ball = lv_obj_create(scr);
+    lv_obj_set_size(s_ball, 24, 24);
+    lv_obj_set_style_radius(s_ball, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_ball, lv_color_make(255, 0, 0), 0);
+    lv_obj_set_style_border_width(s_ball, 0, 0);
+    lv_obj_remove_flag(s_ball, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_exec_cb(&a, anim_orbit_cb);
+    lv_anim_set_values(&a, 0, 360);
+    lv_anim_set_duration(&a, 3000);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
 }
 
 void app_main(void)
@@ -253,47 +433,23 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
-    draw_window(0, 0, LCD_H - 1, LCD_V - 1, px_black, NULL);   // clear the screen
-    cdc_log("LCD ready, bouncing ball");
+    lv_init();
+    lv_tick_set_cb(lvgl_tick_cb);
+    lv_display_t *disp = lv_display_create(LCD_H, LCD_V);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB888);
+    void *b1 = heap_caps_malloc(LVGL_BUF_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *b2 = heap_caps_malloc(LVGL_BUF_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!b1 || !b2) { ESP_LOGE(TAG, "no memory for the LVGL draw buffers"); return; }
+    lv_display_set_buffers(disp, b1, b2, LVGL_BUF_BYTES, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(disp, lvgl_flush_cb);
+    lv_display_add_event_cb(disp, lvgl_round_cb, LV_EVENT_INVALIDATE_AREA, NULL);
 
-    ball_t cur = { LCD_H / 2, LCD_V / 2 }, old = cur;
-    float px = cur.cx, py = cur.cy, vx = 3.1f, vy = 2.3f;   // pixels per frame
-    const float lim = SCREEN_R - BALL_R - 2;
-    TickType_t t_log = xTaskGetTickCount();
-    int frames = 0;
-    for (;;) {
-        old = cur;
-        px += vx;
-        py += vy;
-        // bounce on the round screen edge: reflect the velocity about the normal
-        float dx = px - LCD_H / 2, dy = py - LCD_V / 2;
-        float d2 = dx * dx + dy * dy;
-        if (d2 > lim * lim) {
-            float d = sqrtf(d2);
-            float nx = dx / d, ny = dy / d;
-            float dot = vx * nx + vy * ny;
-            if (dot > 0) {          // moving outwards: v' = v - 2 (v.n) n
-                vx -= 2 * dot * nx;
-                vy -= 2 * dot * ny;
-                // small angle jitter so the path never repeats exactly
-                float c = 0.996f, sn = 0.09f * ((frames & 1) ? 1 : -1);
-                float tx = vx * c - vy * sn;
-                vy = vx * sn + vy * c;
-                vx = tx;
-            }
-            px = LCD_H / 2 + nx * (lim - 1);
-            py = LCD_V / 2 + ny * (lim - 1);
-        }
-        cur.cx = (int)(px + 0.5f);
-        cur.cy = (int)(py + 0.5f);
-        esp_err_t e = draw_ball(&old, &cur);
-        if (e != ESP_OK) { cdc_log("draw error: %s", esp_err_to_name(e)); vTaskDelay(pdMS_TO_TICKS(500)); }
-        frames++;
-        if (xTaskGetTickCount() - t_log >= pdMS_TO_TICKS(5000)) {
-            cdc_log("ball at (%d,%d) v=(%.2f,%.2f), %d frames in 5 s", cur.cx, cur.cy, vx, vy, frames);
-            frames = 0;
-            t_log = xTaskGetTickCount();
-        }
-        vTaskDelay(1);
-    }
+    touch_init();
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, touch_read_cb);
+
+    ui_create();
+    xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 4, NULL);
+    cdc_log("LVGL %d.%d.%d running", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
 }
