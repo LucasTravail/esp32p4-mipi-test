@@ -1,0 +1,11 @@
+{
+  "idf.customExtraVars": {
+    "IDF_PATH": "C:/esp/v5.5.5/esp-idf",
+    "IDF_TOOLS_PATH": "C:/Espressif",
+    "IDF_PYTHON_ENV_PATH": "C:/Espressif/tools/python/v5.5.5/venv"
+  },
+  "idf.adapterTargetName": "esp32p4",
+  "idf.flashType": "UART",
+  "idf.currentSetup": "C:/esp/v5.5.5/esp-idf",
+  "idf.port": "COM16"
+}

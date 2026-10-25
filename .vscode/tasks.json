@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    { "id": "appPort", "type": "promptString", "description": "Current firmware CDC port", "default": "COM37" },
+    { "id": "romPort", "type": "promptString", "description": "ROM loader port expected after 1200 bps reset", "default": "COM36" }
+  ],
+  "tasks": [
+    {
+      "label": "P4: CDC 1200 -> ROM port -> flash -> back to firmware",
+      "type": "shell",
+      "command": "call \"C:\\esp\\v5.5.5\\esp-idf\\export.bat\" && python \"${workspaceFolder}\\scripts\\flash_via_1200.py\" --project-dir \"${workspaceFolder}\" --app-port ${input:appPort} --rom-port ${input:romPort}",
+      "options": {
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] },
+        "env": {
+          "IDF_PATH": "C:\\esp\\v5.5.5\\esp-idf",
+          "IDF_TOOLS_PATH": "C:\\Espressif",
+          "IDF_PYTHON_ENV_PATH": "C:\\Espressif\\tools\\python\\v5.5.5\\venv"
+        }
+      },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    }
+  ]
+}
