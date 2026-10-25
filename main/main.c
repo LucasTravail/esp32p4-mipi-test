@@ -4,6 +4,7 @@
 // + TinyUSB CDC ACM with "1200 baud => ROM download mode" auto-reset, and logs over CDC.
 #include <stdarg.h>
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -148,30 +149,80 @@ static esp_err_t lcd_start(void)
     return ESP_OK;
 }
 
-// Fill the whole panel with one colour: RAMW (0x2C) with the first chunk, then RAMWC (0x3C).
-// The IDF DCS-long-write helper pushes the whole payload into the host's payload FIFO *before*
-// the packet header, so a payload bigger than that FIFO deadlocks: keep packets small
-// (40 px = 120 bytes + command byte = 31 words).
+// RAMW (0x2C) / RAMWC (0x3C) are sent in HS and in small packets: the IDF DCS long-write helper pushes
+// the whole payload into the host's payload FIFO *before* the packet header, so a payload bigger than
+// that FIFO deadlocks (40 px = 120 bytes + command byte = 31 words is safe).
 #define CHUNK_PX 40
-static esp_err_t fill_color(uint8_t r, uint8_t g, uint8_t b)
+#define COL_OFFSET 6   // the panel's 466 columns start at GRAM column 6 (CASET 6..471)
+
+static esp_err_t set_window(int x0, int y0, int x1, int y1)
 {
-    static uint8_t buf[CHUNK_PX * 3];
-    for (int x = 0; x < CHUNK_PX; x++) {
-        buf[3 * x + 0] = r;
-        buf[3 * x + 1] = g;
-        buf[3 * x + 2] = b;
-    }
-    esp_err_t err = esp_lcd_panel_io_tx_param(s_io, 0x2A, k_init[0].p, 4);   // reset write window
-    if (err == ESP_OK) err = esp_lcd_panel_io_tx_param(s_io, 0x2B, k_init[1].p, 4);
-    int remaining = LCD_H * LCD_V;
-    bool first = true;
-    while (remaining > 0 && err == ESP_OK) {
-        int px = remaining < CHUNK_PX ? remaining : CHUNK_PX;
-        err = esp_lcd_panel_io_tx_param(s_io, first ? 0x2C : 0x3C, buf, px * 3);
-        first = false;
-        remaining -= px;
-    }
+    const uint8_t ca[4] = { (x0 + COL_OFFSET) >> 8, (x0 + COL_OFFSET) & 0xFF, (x1 + COL_OFFSET) >> 8, (x1 + COL_OFFSET) & 0xFF };
+    const uint8_t ra[4] = { y0 >> 8, y0 & 0xFF, y1 >> 8, y1 & 0xFF };
+    esp_err_t err = esp_lcd_panel_io_tx_param(s_io, 0x2A, ca, 4);
+    if (err == ESP_OK) err = esp_lcd_panel_io_tx_param(s_io, 0x2B, ra, 4);
     return err;
+}
+
+typedef void (*pixel_fn)(int x, int y, uint8_t *rgb, void *ctx);
+
+// Write the window x0..x1 / y0..y1 (inclusive) pixel by pixel through fn().
+static esp_err_t draw_window(int x0, int y0, int x1, int y1, pixel_fn fn, void *ctx)
+{
+    esp_err_t err = set_window(x0, y0, x1, y1);
+    static uint8_t buf[CHUNK_PX * 3];
+    int n = 0;
+    bool first = true;
+    for (int y = y0; y <= y1 && err == ESP_OK; y++) {
+        for (int x = x0; x <= x1 && err == ESP_OK; x++) {
+            fn(x, y, &buf[3 * n], ctx);
+            if (++n == CHUNK_PX) {
+                err = esp_lcd_panel_io_tx_param(s_io, first ? 0x2C : 0x3C, buf, n * 3);
+                first = false;
+                n = 0;
+            }
+        }
+    }
+    if (err == ESP_OK && n) err = esp_lcd_panel_io_tx_param(s_io, first ? 0x2C : 0x3C, buf, n * 3);
+    return err;
+}
+
+static void px_black(int x, int y, uint8_t *rgb, void *ctx) { rgb[0] = rgb[1] = rgb[2] = 0; }
+
+// ---- Bouncing ball -------------------------------------------------------------
+#define BALL_R   22
+#define ERASE_MARGIN 4   // the redrawn box is bigger than old+new ball, so nothing of the old image stays
+#define SCREEN_R 233   // the panel is round: 466 / 2
+
+typedef struct { int cx, cy; } ball_t;
+
+static void px_ball(int x, int y, uint8_t *rgb, void *ctx)
+{
+    const ball_t *b = ctx;
+    int dx = x - b->cx, dy = y - b->cy;
+    bool inside = dx * dx + dy * dy <= BALL_R * BALL_R;
+    rgb[0] = inside ? 255 : 0;   // solid red ball on a black background
+    rgb[1] = 0;
+    rgb[2] = 0;
+}
+
+static esp_err_t draw_ball(const ball_t *old, const ball_t *cur)
+{
+    int x0 = (old->cx < cur->cx ? old->cx : cur->cx) - BALL_R - ERASE_MARGIN;
+    int x1 = (old->cx > cur->cx ? old->cx : cur->cx) + BALL_R + ERASE_MARGIN;
+    int y0 = (old->cy < cur->cy ? old->cy : cur->cy) - BALL_R - ERASE_MARGIN;
+    int y1 = (old->cy > cur->cy ? old->cy : cur->cy) + BALL_R + ERASE_MARGIN;
+    // clip, and keep an even start column and an even width (partial-update restriction of the chip)
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > LCD_H - 1) x1 = LCD_H - 1;
+    if (y1 > LCD_V - 1) y1 = LCD_V - 1;
+    // datasheet (CASET/RASET): for partial updates the start and the size must be even, in X AND in Y
+    x0 &= ~1;
+    x1 |= 1;
+    y0 &= ~1;
+    y1 |= 1;
+    return draw_window(x0, y0, x1, y1, px_ball, (void *)cur);
 }
 
 void app_main(void)
@@ -189,45 +240,60 @@ void app_main(void)
         ESP_LOGE(TAG, "LCD init failed: %s (no retry, USB stays active)", esp_err_to_name(err));
         return;
     }
-    cdc_log("LCD init done, drawing colours with DCS RAM writes");
     vTaskDelay(pdMS_TO_TICKS(300));
 
-    // The datasheet says RAMW/RAMWC must be sent in MIPI HS format: DCS long writes in HS (0 = HS, 1 = LP).
+    // RAMW/RAMWC must be sent in MIPI HS format (datasheet): DCS long writes in HS (0 = HS, 1 = LP).
     MIPI_DSI_HOST.cmd_mode_cfg.dcs_lw_tx = 0;
-    // The power IC for ELVDD/ELVSS is driven by the CH13613 over SWIRE; force it on (reg 0x6C = 0xA5)
-    // and set full brightness, in case it is not enabled automatically without a video stream.
+    // The power IC for ELVDD/ELVSS is driven by the CH13613 over SWIRE: force it on (0x6C = 0xA5),
+    // full brightness (0x51 = 0xFF). Without this the panel stays black.
     {
         const uint8_t sw = 0xA5, dbv = 0xFF;
         esp_lcd_panel_io_tx_param(s_io, 0x6C, &sw, 1);
         esp_lcd_panel_io_tx_param(s_io, 0x51, &dbv, 1);
-        uint8_t v6c = 0xEE, v51 = 0xEE;
-        esp_lcd_panel_io_rx_param(s_io, 0x52, &v51, 1);
-        cdc_log("SWIRE manual=A5 sent, brightness readback=%02X", v51);
-        (void)v6c;
         vTaskDelay(pdMS_TO_TICKS(200));
     }
-    // (ALLPON/ALLPOFF test removed: ALLPOFF is not left by NORON on this chip, ImgMode stayed 0x08)
-    uint8_t pm = 0xEE, im = 0xEE;
-    esp_lcd_panel_io_rx_param(s_io, 0x0A, &pm, 1);
-    esp_lcd_panel_io_rx_param(s_io, 0x0D, &im, 1);
-    cdc_log("after NORON: PowerMode=%02X ImgMode=%02X", pm, im);
 
-    static const struct { const char *name; uint8_t r, g, b; } colors[] = {
-        {"red", 255, 0, 0}, {"green", 0, 255, 0}, {"blue", 0, 0, 255},
-        {"white", 255, 255, 255}, {"black", 0, 0, 0},
-    };
-    for (size_t i = 0;; i = (i + 1) % (sizeof(colors) / sizeof(colors[0]))) {
-        TickType_t t0 = xTaskGetTickCount();
-        esp_err_t e = fill_color(colors[i].r, colors[i].g, colors[i].b);
-        // read back the first 2 pixels of the GRAM to check that the write really landed
-        uint8_t rd[7] = {0};
-        esp_lcd_panel_io_tx_param(s_io, 0x2A, k_init[0].p, 4);
-        esp_lcd_panel_io_tx_param(s_io, 0x2B, k_init[1].p, 4);
-        esp_err_t er = esp_lcd_panel_io_rx_param(s_io, 0x2E, rd, sizeof(rd));
-        cdc_log("GRAM read (%s): %02X %02X %02X %02X %02X %02X %02X", er == ESP_OK ? "ok" : "ERR",
-                rd[0], rd[1], rd[2], rd[3], rd[4], rd[5], rd[6]);
-        cdc_log("colour: %s  (write %s, %lld ms)", colors[i].name, e == ESP_OK ? "ok" : esp_err_to_name(e),
-                (long long)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS));
-        vTaskDelay(pdMS_TO_TICKS(1500));
+    draw_window(0, 0, LCD_H - 1, LCD_V - 1, px_black, NULL);   // clear the screen
+    cdc_log("LCD ready, bouncing ball");
+
+    ball_t cur = { LCD_H / 2, LCD_V / 2 }, old = cur;
+    float px = cur.cx, py = cur.cy, vx = 3.1f, vy = 2.3f;   // pixels per frame
+    const float lim = SCREEN_R - BALL_R - 2;
+    TickType_t t_log = xTaskGetTickCount();
+    int frames = 0;
+    for (;;) {
+        old = cur;
+        px += vx;
+        py += vy;
+        // bounce on the round screen edge: reflect the velocity about the normal
+        float dx = px - LCD_H / 2, dy = py - LCD_V / 2;
+        float d2 = dx * dx + dy * dy;
+        if (d2 > lim * lim) {
+            float d = sqrtf(d2);
+            float nx = dx / d, ny = dy / d;
+            float dot = vx * nx + vy * ny;
+            if (dot > 0) {          // moving outwards: v' = v - 2 (v.n) n
+                vx -= 2 * dot * nx;
+                vy -= 2 * dot * ny;
+                // small angle jitter so the path never repeats exactly
+                float c = 0.996f, sn = 0.09f * ((frames & 1) ? 1 : -1);
+                float tx = vx * c - vy * sn;
+                vy = vx * sn + vy * c;
+                vx = tx;
+            }
+            px = LCD_H / 2 + nx * (lim - 1);
+            py = LCD_V / 2 + ny * (lim - 1);
+        }
+        cur.cx = (int)(px + 0.5f);
+        cur.cy = (int)(py + 0.5f);
+        esp_err_t e = draw_ball(&old, &cur);
+        if (e != ESP_OK) { cdc_log("draw error: %s", esp_err_to_name(e)); vTaskDelay(pdMS_TO_TICKS(500)); }
+        frames++;
+        if (xTaskGetTickCount() - t_log >= pdMS_TO_TICKS(5000)) {
+            cdc_log("ball at (%d,%d) v=(%.2f,%.2f), %d frames in 5 s", cur.cx, cur.cy, vx, vy, frames);
+            frames = 0;
+            t_log = xTaskGetTickCount();
+        }
+        vTaskDelay(1);
     }
 }
