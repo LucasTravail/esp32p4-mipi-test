@@ -23,6 +23,9 @@
 #include "driver/i2c_master.h"
 #include "esp_rom_sys.h"
 #include "lvgl.h"
+#if __has_include("esp32p4_ui.h")
+#include "esp32p4_ui.h"
+#endif
 
 static const char *TAG = "p4_mipi";
 
@@ -449,7 +452,13 @@ void app_main(void)
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, touch_read_cb);
 
-    ui_create();
+#if __has_include("esp32p4_ui.h")
+    // UI exported by the LVGL Pro Editor from ../ui (project name esp32p4_ui, start screen main_screen)
+    esp32p4_ui_init("");
+    lv_screen_load(main_screen_create());
+#else
+    ui_create();   // built-in demo UI
+#endif
     xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 4, NULL);
     cdc_log("LVGL %d.%d.%d running", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
 }
