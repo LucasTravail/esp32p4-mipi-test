@@ -20,6 +20,7 @@
 #include "soc/lp_system_reg.h"
 #include "soc/mipi_dsi_host_struct.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/i2c_master.h"
 #include "esp_rom_sys.h"
 #include "lvgl.h"
@@ -327,9 +328,13 @@ static void lvgl_round_cb(lv_event_t *e)
     if (a->y2 > LCD_V - 1) a->y2 = LCD_V - 1;
 }
 
+static volatile int64_t g_fl_us, g_lv_us;
+static volatile int g_fl_n, g_fl_px;
+
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     static uint8_t buf[CHUNK_PX * 3];
+    int64_t t0 = esp_timer_get_time();
     esp_err_t err = set_window(area->x1, area->y1, area->x2, area->y2);
     int total = (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
     bool first = true;
@@ -346,6 +351,9 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
         total -= n;
     }
     if (err != ESP_OK) ESP_LOGE(TAG, "flush failed: %s", esp_err_to_name(err));
+    g_fl_us += esp_timer_get_time() - t0;
+    g_fl_n++;
+    g_fl_px += (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
     lv_display_flush_ready(disp);
 }
 
@@ -354,7 +362,15 @@ static uint32_t lvgl_tick_cb(void) { return xTaskGetTickCount() * portTICK_PERIO
 static void lvgl_task(void *arg)
 {
     for (;;) {
+        int64_t t0 = esp_timer_get_time();
         uint32_t wait_ms = lv_timer_handler();
+        g_lv_us += esp_timer_get_time() - t0;
+        static int64_t last;
+        if (t0 - last > 2000000) {
+            cdc_log("perf: handler %d ms, flush %d ms (%d flushes, %d px) per 2 s", (int)(g_lv_us / 1000),
+                    (int)(g_fl_us / 1000), g_fl_n, g_fl_px);
+            g_lv_us = g_fl_us = 0; g_fl_n = g_fl_px = 0; last = t0;
+        }
         vTaskDelay(pdMS_TO_TICKS(wait_ms < 10 ? 10 : (wait_ms > 100 ? 100 : wait_ms)));
     }
 }
@@ -695,6 +711,332 @@ static void hw_test_run(void)
     }
 }
 
+
+// ---- MJPEG clip (main/clip.bin, made by tools/make_clip.py), played on a button ----
+extern const uint8_t clip_start[] asm("_binary_clip_bin_start");
+extern const uint8_t clip_end[] asm("_binary_clip_bin_end");
+static lv_image_dsc_t s_frame_dsc;
+static lv_obj_t *s_video_img;
+static lv_timer_t *s_video_timer;
+static const uint8_t *s_frame_ptr;
+
+static void video_stop(void)
+{
+    lv_timer_pause(s_video_timer);
+    lv_obj_add_flag(s_video_img, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void video_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (s_frame_ptr >= clip_end) {      // clip finished: back to the menu, no loop
+        video_stop();
+        return;
+    }
+    uint32_t sz;
+    memcpy(&sz, s_frame_ptr, 4);
+    s_frame_dsc.data = s_frame_ptr + 4;
+    s_frame_dsc.data_size = sz;
+    s_frame_ptr += 4 + sz;
+    lv_image_cache_drop(&s_frame_dsc);
+    static int n;
+    if (n++ < 3) {
+        lv_image_header_t h;
+        lv_result_t r = lv_image_decoder_get_info(&s_frame_dsc, &h);
+        cdc_log("video frame size=%u info=%d %dx%d", (unsigned)sz, (int)r, (int)h.w, (int)h.h);
+    }
+    lv_image_set_src(s_video_img, &s_frame_dsc);
+}
+
+static void video_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    s_frame_ptr = clip_start;
+    lv_obj_remove_flag(s_video_img, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_reset(s_video_timer);
+    lv_timer_resume(s_video_timer);
+}
+
+static void video_img_cb(lv_event_t *e)     // tap during playback = stop
+{
+    (void)e;
+    video_stop();
+}
+
+static void video_button_create(lv_obj_t *scr)
+{
+    s_frame_ptr = clip_start;
+    s_frame_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    s_frame_dsc.header.cf = LV_COLOR_FORMAT_RAW;
+    s_frame_dsc.header.w = 466;
+    s_frame_dsc.header.h = 466;
+    s_video_img = lv_image_create(scr);
+    lv_obj_align(s_video_img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(s_video_img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_video_img, video_img_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_video_img, LV_OBJ_FLAG_HIDDEN);
+    s_video_timer = lv_timer_create(video_tick, 125, NULL);
+    lv_timer_pause(s_video_timer);
+
+    // reuse the "Touch me" button of the exported screen
+    lv_obj_t *b = NULL;
+    for (uint32_t i = 0; i < lv_obj_get_child_count(scr); i++) {
+        lv_obj_t *c = lv_obj_get_child(scr, i);
+        if (lv_obj_check_type(c, &lv_button_class)) { b = c; break; }
+    }
+    cdc_log("video: button %s", b ? "found" : "NOT found");
+    if (!b) return;
+    lv_obj_add_event_cb(b, video_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ---- Digital caliper gauge: ONE round gauge, 0 at the top, +-150 mm = one full turn ----
+// Positive fills clockwise (blue), negative counter-clockwise (red). The colour depends on the POSITION on the
+// ring (light near 0, darker and darker with the distance from the top). The ring is drawn by a single custom
+// draw callback (CAL_SEGS fixed-colour slices + two round caps) and only the small area around the moving tip is
+// invalidated, so very little has to be re-rendered and sent over DSI.
+#define UI_CALIPER      1
+#define CALIPER_MAX_MM  150     // one full turn = 150 mm
+#define CAL_SEGS        72
+#define CAL_SEG_DEG     (360 / CAL_SEGS)
+#define CAL_SIZE        450
+#define CAL_WIDTH       30
+#define CAL_POS_LIGHT   0x2EB4FF
+#define CAL_POS_DARK    0x001C6B
+#define CAL_NEG_LIGHT   0xFF3B30
+#define CAL_NEG_DARK    0x5A0000
+
+extern const uint8_t value_font_start[] asm("_binary_value_font_ttf_start");
+extern const uint8_t value_font_end[] asm("_binary_value_font_ttf_end");
+static lv_obj_t *s_cal_gauge, *s_cal_val, *s_cal_unit;
+static int s_cal_neg, s_cal_fill, s_cal_v = 1 << 30;      // direction, filled degrees from the top
+
+static lv_color_t caliper_col(int neg, int dist_deg)        // colour at a distance from the top, in degrees
+{
+    return lv_color_mix(lv_color_hex(neg ? CAL_NEG_DARK : CAL_POS_DARK),
+                        lv_color_hex(neg ? CAL_NEG_LIGHT : CAL_POS_LIGHT),
+                        (uint8_t)(dist_deg * 255 / 360));
+}
+
+static void caliper_pt(const lv_area_t *c, int deg, int *x, int *y)   // point on the ring centre line
+{
+    float r = (CAL_SIZE - CAL_WIDTH) / 2.0f, t = (float)deg * (float)M_PI / 180.0f;
+    *x = (c->x1 + c->x2) / 2 + (int)lroundf(r * sinf(t));
+    *y = (c->y1 + c->y2) / 2 - (int)lroundf(r * cosf(t));
+}
+
+static void caliper_disc(lv_layer_t *layer, const lv_area_t *c, int deg, lv_color_t col)
+{
+    int x, y;
+    caliper_pt(c, deg, &x, &y);
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.bg_color = col;
+    d.radius = LV_RADIUS_CIRCLE;
+    lv_area_t a = {x - CAL_WIDTH / 2, y - CAL_WIDTH / 2, x + CAL_WIDTH / 2 - 1, y + CAL_WIDTH / 2 - 1};
+    lv_draw_rect(layer, &d, &a);
+}
+
+static void caliper_draw_cb(lv_event_t *e)
+{
+    lv_layer_t *layer = lv_event_get_layer(e);
+    lv_obj_t *obj = lv_event_get_target_obj(e);
+    lv_area_t c;
+    lv_obj_get_coords(obj, &c);
+    const lv_area_t *clip = &layer->_clip_area;
+    int cx = (c.x1 + c.x2) / 2, cy = (c.y1 + c.y2) / 2, ro = CAL_SIZE / 2, ri = ro - CAL_WIDTH;
+
+    // nothing of the ring in this clip (e.g. only the central label is being redrawn)?
+    int fx = LV_MAX(LV_ABS(clip->x1 - cx), LV_ABS(clip->x2 - cx)), fy = LV_MAX(LV_ABS(clip->y1 - cy), LV_ABS(clip->y2 - cy));
+    if (fx * fx + fy * fy < ri * ri) return;
+
+    lv_draw_arc_dsc_t d;
+    lv_draw_arc_dsc_init(&d);
+    d.center.x = cx;
+    d.center.y = cy;
+    d.radius = ro;
+    d.width = CAL_WIDTH;
+    d.color = lv_color_hex(0x262626);                 // grey track
+    d.start_angle = 0;
+    d.end_angle = 359;
+    lv_draw_arc(layer, &d);
+
+    int fs = s_cal_neg ? 360 - s_cal_fill : 0, fe = s_cal_neg ? 360 : s_cal_fill;
+    for (int k = 0; k < CAL_SEGS && s_cal_fill > 0; k++) {
+        int lo = k * CAL_SEG_DEG, hi = lo + CAL_SEG_DEG;
+        int s = fs > lo ? fs : lo, en = fe < hi ? fe : hi;
+        if (en <= s) continue;
+        int mid = lo + CAL_SEG_DEG / 2;
+        d.color = caliper_col(s_cal_neg, s_cal_neg ? 360 - mid : mid);
+        d.start_angle = (s + 270) % 360;                         // LVGL: 0 = 3 o'clock, clockwise
+        d.end_angle = (en + 270 + (en < 360 ? 1 : 0)) % 360;     // 1 degree overlap hides the seam
+        lv_draw_arc(layer, &d);
+    }
+    if (s_cal_fill > 0) {
+        caliper_disc(layer, &c, 0, caliper_col(s_cal_neg, 0));
+        caliper_disc(layer, &c, s_cal_neg ? 360 - s_cal_fill : s_cal_fill, caliper_col(s_cal_neg, s_cal_fill));
+    }
+}
+
+// invalidate the box around the ring between two angles (clockwise from the top)
+static void caliper_inv(int d1, int d2)
+{
+    lv_area_t c, a;
+    lv_obj_get_coords(s_cal_gauge, &c);
+    int x, y, step = 5;
+    a.x1 = a.y1 = 10000;
+    a.x2 = a.y2 = -10000;
+    for (int d = d1; d <= d2 + step - 1; d += step) {
+        caliper_pt(&c, d < d2 ? d : d2, &x, &y);
+        a.x1 = LV_MIN(a.x1, x); a.y1 = LV_MIN(a.y1, y);
+        a.x2 = LV_MAX(a.x2, x); a.y2 = LV_MAX(a.y2, y);
+        if (d >= d2) break;
+    }
+    lv_area_t r = {a.x1 - CAL_WIDTH - 2, a.y1 - CAL_WIDTH - 2, a.x2 + CAL_WIDTH + 2, a.y2 + CAL_WIDTH + 2};
+    lv_obj_invalidate_area(s_cal_gauge, &r);
+}
+
+static void caliper_set_mm100(int v)       // v in 1/100 mm, -15000..15000
+{
+    const int lim = CALIPER_MAX_MM * 100;
+    if (v < -lim) v = -lim;
+    if (v > lim) v = lim;
+    int neg = v < 0;
+    int a = neg ? -v : v;
+    int fill = (int)((float)a * 360.0f / (float)lim + 0.5f);      // degrees filled from the top
+
+    if (neg != s_cal_neg || fill != s_cal_fill) {
+        int on = s_cal_neg, of = s_cal_fill;
+        s_cal_neg = neg;
+        s_cal_fill = fill;
+        if (on != neg || of == 0 || fill == 0) {                  // direction / start cap changed: whole filled span
+            caliper_inv(0, of > fill ? of : fill);
+            if (on != neg) caliper_inv(0, fill);
+        } else {                                                  // only the part between the old and new tip
+            int lo = of < fill ? of : fill, hi = of < fill ? fill : of;
+            caliper_inv(neg ? 360 - hi : lo, neg ? 360 - lo : hi);
+        }
+    }
+    if (v != s_cal_v) {
+        s_cal_v = v;
+        lv_label_set_text_fmt(s_cal_val, "%s%d.%02d", neg ? "-" : "", a / 100, a % 100);
+    }
+}
+
+static void caliper_demo_cb(lv_timer_t *t)  // fake measurement sweeping 0 -> +150 -> 0 -> -150 -> 0 mm, 24 s per cycle
+{
+    (void)t;
+    float ph = (float)lv_tick_get() / 24000.0f * 2.0f * (float)M_PI;
+    caliper_set_mm100((int)(sinf(ph) * CALIPER_MAX_MM * 100));
+}
+
+static lv_obj_t *caliper_create(void)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_border_width(scr, 0, 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_cal_gauge = lv_obj_create(scr);
+    lv_obj_set_size(s_cal_gauge, CAL_SIZE, CAL_SIZE);
+    lv_obj_center(s_cal_gauge);
+    lv_obj_set_style_bg_opa(s_cal_gauge, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_cal_gauge, 0, 0);
+    lv_obj_set_style_pad_all(s_cal_gauge, 0, 0);
+    lv_obj_remove_flag(s_cal_gauge, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);   // display only
+    lv_obj_add_event_cb(s_cal_gauge, caliper_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    s_cal_val = lv_label_create(scr);
+    lv_font_t *big = lv_tiny_ttf_create_data(value_font_start, value_font_end - value_font_start, 68);
+    lv_obj_set_style_text_font(s_cal_val, big ? big : &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(s_cal_val, lv_color_white(), 0);
+    lv_obj_align(s_cal_val, LV_ALIGN_CENTER, 0, 0);
+
+    s_cal_unit = lv_label_create(scr);
+    lv_label_set_text(s_cal_unit, "mm");
+    lv_obj_set_style_text_font(s_cal_unit, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_cal_unit, lv_color_white(), 0);
+    lv_obj_align(s_cal_unit, LV_ALIGN_CENTER, 0, 75);
+
+    caliper_set_mm100(0);
+    lv_timer_create(caliper_demo_cb, 33, NULL);
+    return scr;
+}
+
+// ---- 4-way swipe navigation: the gauge is home, each direction slides to a (for now empty) menu ----
+typedef struct { lv_obj_t *dest; lv_screen_load_anim_t anim; } nav_link_t;
+#define NAV_ANIM_MS 380
+
+static int nav_dir_idx(lv_dir_t d)
+{
+    switch (d) {
+    case LV_DIR_LEFT:   return 0;
+    case LV_DIR_RIGHT:  return 1;
+    case LV_DIR_TOP:    return 2;
+    case LV_DIR_BOTTOM: return 3;
+    default:            return -1;
+    }
+}
+
+static void nav_gesture_cb(lv_event_t *e)
+{
+    static uint32_t last;
+    lv_obj_t *scr = lv_event_get_current_target_obj(e);
+    int dir = nav_dir_idx(lv_indev_get_gesture_dir(lv_indev_active()));
+    uint32_t now = lv_tick_get();
+    if (dir < 0 || now - last < NAV_ANIM_MS + 80) return;          // ignore while an animation is running
+    nav_link_t *l = (nav_link_t *)lv_obj_get_user_data(scr);
+    if (!l || !l[dir].dest) return;
+    last = now;
+    lv_screen_load_anim(l[dir].dest, l[dir].anim, NAV_ANIM_MS, 0, false);
+}
+
+static lv_obj_t *nav_menu_create(const char *title, const char *arrow, uint32_t col)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(col), 0);
+    lv_obj_set_style_bg_grad_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_border_width(scr, 0, 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *a = lv_label_create(scr);
+    lv_label_set_text(a, arrow);
+    lv_obj_set_style_text_font(a, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(a, lv_color_white(), 0);
+    lv_obj_align(a, LV_ALIGN_CENTER, 0, -30);
+    lv_obj_t *t = lv_label_create(scr);
+    lv_label_set_text(t, title);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(t, lv_color_white(), 0);
+    lv_obj_align(t, LV_ALIGN_CENTER, 0, 35);
+    return scr;
+}
+
+static void nav_init(lv_obj_t *home)
+{
+    // menus: swiping the opposite way comes back
+    lv_obj_t *mr = nav_menu_create("MENU DROITE", LV_SYMBOL_RIGHT, 0x1E6FD9);
+    lv_obj_t *ml = nav_menu_create("MENU GAUCHE", LV_SYMBOL_LEFT, 0x8A2BE2);
+    lv_obj_t *mb = nav_menu_create("MENU BAS", LV_SYMBOL_DOWN, 0x1FA855);
+    lv_obj_t *mt = nav_menu_create("MENU HAUT", LV_SYMBOL_UP, 0xE0801A);
+    static nav_link_t home_l[4], mr_l[4], ml_l[4], mb_l[4], mt_l[4];
+    // index: 0 = swipe LEFT, 1 = RIGHT, 2 = UP, 3 = DOWN
+    home_l[0] = (nav_link_t){mr, LV_SCREEN_LOAD_ANIM_MOVE_LEFT};
+    home_l[1] = (nav_link_t){ml, LV_SCREEN_LOAD_ANIM_MOVE_RIGHT};
+    home_l[2] = (nav_link_t){mb, LV_SCREEN_LOAD_ANIM_MOVE_TOP};
+    home_l[3] = (nav_link_t){mt, LV_SCREEN_LOAD_ANIM_MOVE_BOTTOM};
+    mr_l[1] = (nav_link_t){home, LV_SCREEN_LOAD_ANIM_MOVE_RIGHT};
+    ml_l[0] = (nav_link_t){home, LV_SCREEN_LOAD_ANIM_MOVE_LEFT};
+    mb_l[3] = (nav_link_t){home, LV_SCREEN_LOAD_ANIM_MOVE_BOTTOM};
+    mt_l[2] = (nav_link_t){home, LV_SCREEN_LOAD_ANIM_MOVE_TOP};
+    lv_obj_t *scr[5] = {home, mr, ml, mb, mt};
+    nav_link_t *lk[5] = {home_l, mr_l, ml_l, mb_l, mt_l};
+    for (int i = 0; i < 5; i++) {
+        lv_obj_set_user_data(scr[i], lk[i]);
+        lv_obj_add_event_cb(scr[i], nav_gesture_cb, LV_EVENT_GESTURE, NULL);
+    }
+    lv_screen_load(home);
+}
+
 void app_main(void)
 {
     gpio_config_t led = { .pin_bit_mask = 1ULL << PIN_LED, .mode = GPIO_MODE_OUTPUT };
@@ -752,6 +1094,10 @@ void app_main(void)
     // UI exported by the LVGL Pro Editor from ../ui/esp32p4_ui (start screen: screens/screen1.xml)
     esp32p4_ui_init("");
     lv_screen_load(UI_START_SCREEN_CREATE());
+    video_button_create(lv_screen_active());
+#if UI_CALIPER
+    nav_init(caliper_create());
+#endif
 #else
 #if UI_MIRE
     mire_create();   // built-in test pattern, tap to change

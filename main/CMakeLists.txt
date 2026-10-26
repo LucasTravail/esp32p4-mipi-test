@@ -17,7 +17,7 @@ list(REMOVE_DUPLICATES UI_INCLUDE_DIRS)
 
 idf_component_register(SRCS "main.c" ${UI_SRCS}
                        INCLUDE_DIRS "." ${UI_INCLUDE_DIRS}
-                       REQUIRES esp_lcd esp_mm esp_driver_gpio esp_driver_i2c soc esp_system lvgl__lvgl)
+                       EMBED_FILES "clip.bin" "value_font.ttf" REQUIRES esp_lcd esp_mm esp_driver_gpio esp_driver_i2c soc esp_system esp_timer lvgl__lvgl)
 
 # the generated code includes "lvgl.h"
 if(COMPONENT_LIB)
