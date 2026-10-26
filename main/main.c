@@ -57,7 +57,7 @@ static const lcd_cmd_t k_init[] = {
     {0x64, 1, {0x00}, 0},
     {0x68, 1, {0x01}, 0},
     {0x67, 1, {0x01}, 0},
-    {0x3A, 1, {0x07}, 0},                     // 24 bit/pixel
+    {0x3A, 1, {0x05}, 0},                     // 16 bit/pixel (RGB565): half the data to send
     {0x11, 0, {0}, 120},
     {0x13, 0, {0}, 0},
     {0x29, 0, {0}, 120},
@@ -311,11 +311,74 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     data->state = s_tpress ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
+// ---- Fast pixel path ----------------------------------------------------------------
+// The IDF DBI driver enables command ACK, so after EVERY packet the host turns the bus around (BTA) and waits for
+// the panel to acknowledge: that, not the lane rate, was limiting us to ~7 MB/s. Pixels are written without ACK,
+// packets back to back (the payload must be complete in the host FIFO before the header is written).
+// Pixels are LVGL RGB565 (little endian in memory); the panel wants big endian: swapped on the fly.
+#define FAST_PKT_PX 126    // pixels per DSI packet; the whole payload must fit the host FIFO (header goes last)
+
+static inline uint32_t swap16x2(uint32_t w) { return ((w & 0x00FF00FFu) << 8) | ((w >> 8) & 0x00FF00FFu); }
+
+static volatile int g_dsi_to;
+static inline void dsi_put(uint32_t w)
+{
+    uint32_t guard = 0;
+    while (MIPI_DSI_HOST.cmd_pkt_status.gen_pld_w_full) {
+        if (++guard > 200000) { g_dsi_to++; return; }
+    }
+    MIPI_DSI_HOST.gen_pld_data.val = w;
+}
+
+// One DCS long write: cmd (0x2C first packet / 0x3C continuation) + npx RGB565 pixels (npx even, except the last).
+static void dsi_pixels_packet(uint8_t cmd, const uint16_t *src, int npx)
+{
+    uint32_t bytes = (uint32_t)npx * 2, wc = bytes + 1;
+    uint32_t prev = (uint32_t)cmd << 24;        // the command byte travels in front of the pixel bytes
+    int pairs = npx >> 1;
+    if ((uintptr_t)src & 2) {                   // 2-byte aligned source: build words from halfwords
+        for (int i = 0; i < pairs && !g_dsi_to; i++) {
+            uint32_t w = swap16x2((uint32_t)src[2 * i] | ((uint32_t)src[2 * i + 1] << 16));
+            dsi_put((prev >> 24) | (w << 8));
+            prev = w;
+        }
+    } else {
+        const uint32_t *s32 = (const uint32_t *)src;
+        for (int i = 0; i < pairs && !g_dsi_to; i++) {
+            uint32_t w = swap16x2(s32[i]);
+            dsi_put((prev >> 24) | (w << 8));
+            prev = w;
+        }
+    }
+    if (npx & 1) {                              // odd pixel count (end of an area)
+        uint32_t w = swap16x2(src[npx - 1]);
+        dsi_put((prev >> 24) | (w << 8));       // cmd-shifted: 3 valid bytes (prev top byte + 2 pixel bytes)
+    } else {
+        dsi_put(prev >> 24);                    // the last pixel byte, alone in its word
+    }
+    uint32_t guard = 0;
+    while (MIPI_DSI_HOST.cmd_pkt_status.gen_cmd_full) { if (++guard > 200000) { g_dsi_to++; break; } }
+    MIPI_DSI_HOST.gen_hdr.val = 0x39u | ((wc & 0xFF) << 8) | ((wc >> 8) << 16);   // DCS long write, VC 0
+}
+
+// Send npx pixels to the already-selected window (CASET/RASET), RAMW then RAMWC.
+static void dsi_pixels(const uint16_t *src, int npx)
+{
+    uint8_t cmd = 0x2C;
+    while (npx > 0) {
+        int n = npx < FAST_PKT_PX ? npx : FAST_PKT_PX;
+        dsi_pixels_packet(cmd, src, n);
+        cmd = 0x3C;
+        src += n;
+        npx -= n;
+    }
+}
+
 // ---- LVGL ----------------------------------------------------------------------
 // Partial rendering: LVGL draws into two small internal-RAM buffers and flush_cb sends each dirty
 // rectangle into the panel's GRAM (DCS RAMW/RAMWC in HS). The panel needs even-aligned windows.
-#define DRAW_LINES 40
-#define LVGL_BUF_BYTES (LCD_H * DRAW_LINES * 3)
+#define DRAW_LINES 60
+#define LVGL_BUF_BYTES (LCD_H * DRAW_LINES * 2)
 
 static void lvgl_round_cb(lv_event_t *e)
 {
@@ -333,27 +396,19 @@ static volatile int g_fl_n, g_fl_px;
 
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    static uint8_t buf[CHUNK_PX * 3];
     int64_t t0 = esp_timer_get_time();
     esp_err_t err = set_window(area->x1, area->y1, area->x2, area->y2);
-    int total = (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
-    bool first = true;
-    while (total > 0 && err == ESP_OK) {
-        int n = total < CHUNK_PX ? total : CHUNK_PX;
-        for (int i = 0; i < n; i++) {   // LVGL RGB888 is B,G,R in memory; the panel wants R,G,B
-            buf[3 * i + 0] = px_map[3 * i + 2];
-            buf[3 * i + 1] = px_map[3 * i + 1];
-            buf[3 * i + 2] = px_map[3 * i + 0];
-        }
-        err = esp_lcd_panel_io_tx_param(s_io, first ? 0x2C : 0x3C, buf, n * 3);
-        first = false;
-        px_map += n * 3;
-        total -= n;
-    }
-    if (err != ESP_OK) ESP_LOGE(TAG, "flush failed: %s", esp_err_to_name(err));
+    int npx = (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
+    if (err == ESP_OK) dsi_pixels((const uint16_t *)px_map, npx);
+    else ESP_LOGE(TAG, "flush failed: %s", esp_err_to_name(err));
     g_fl_us += esp_timer_get_time() - t0;
+    if (g_dsi_to) {
+        static int rep;
+        if (rep++ < 5) cdc_log("DSI timeout x%d status=0x%08x", g_dsi_to, (unsigned)MIPI_DSI_HOST.cmd_pkt_status.val);
+        g_dsi_to = 0;
+    }
     g_fl_n++;
-    g_fl_px += (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
+    g_fl_px += npx;
     lv_display_flush_ready(disp);
 }
 
@@ -1056,6 +1111,7 @@ void app_main(void)
 
     // RAMW/RAMWC must be sent in MIPI HS format (datasheet): DCS long writes in HS (0 = HS, 1 = LP).
     MIPI_DSI_HOST.cmd_mode_cfg.dcs_lw_tx = 0;
+    MIPI_DSI_HOST.cmd_mode_cfg.ack_rqst_en = 0;   // no bus turn-around after each packet (see dsi_pixels)
     // The power IC for ELVDD/ELVSS is driven by the CH13613 over SWIRE: force it on (0x6C = 0xA5),
     // full brightness (0x51 = 0xFF). Without this the panel stays black.
     {
@@ -1078,7 +1134,7 @@ void app_main(void)
     lv_init();
     lv_tick_set_cb(lvgl_tick_cb);
     lv_display_t *disp = lv_display_create(LCD_H, LCD_V);
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB888);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
     void *b1 = heap_caps_malloc(LVGL_BUF_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     void *b2 = heap_caps_malloc(LVGL_BUF_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!b1 || !b2) { ESP_LOGE(TAG, "no memory for the LVGL draw buffers"); return; }
