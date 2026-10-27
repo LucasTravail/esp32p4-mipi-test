@@ -15,9 +15,9 @@ foreach(h ${UI_HDRS})
 endforeach()
 list(REMOVE_DUPLICATES UI_INCLUDE_DIRS)
 
-idf_component_register(SRCS "main.c" ${UI_SRCS}
+idf_component_register(SRCS "main.c" "c2.c" ${UI_SRCS}
                        INCLUDE_DIRS "." ${UI_INCLUDE_DIRS}
-                       EMBED_FILES "clip.bin" "value_font.ttf" REQUIRES esp_lcd esp_mm esp_driver_gpio esp_driver_i2c soc esp_system esp_timer lvgl__lvgl)
+                       EMBED_FILES "clip.bin" "value_font.ttf" REQUIRES esp_lcd esp_mm esp_driver_gpio esp_driver_i2c soc esp_system esp_timer esp_driver_uart esp_adc espressif__esp-serial-flasher lvgl__lvgl)
 
 # the generated code includes "lvgl.h"
 if(COMPONENT_LIB)

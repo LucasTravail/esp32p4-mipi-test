@@ -21,6 +21,9 @@
 #include "soc/mipi_dsi_host_struct.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "driver/i2c_master.h"
 #include "esp_rom_sys.h"
 #include "lvgl.h"
@@ -100,7 +103,7 @@ static esp_err_t usb_start(void)
 }
 
 // ---- Logging over USB CDC (UART0 not always reachable) ----------------------
-static void cdc_log(const char *fmt, ...)
+void cdc_log(const char *fmt, ...)
 {
     char buf[200];
     va_list ap;
@@ -311,6 +314,11 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     data->state = s_tpress ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
+// ESP8684 link test (c2.c). Result so far: GPIO8 of the ESP8684 reads low, so it cannot enter download mode
+// (needs a pull-up on GPIO8): leave it off until the hardware is fixed.
+#define C2_PROBE 0
+void c2_probe(void);
+
 // ---- Fast pixel path ----------------------------------------------------------------
 // The IDF DBI driver enables command ACK, so after EVERY packet the host turns the bus around (BTA) and waits for
 // the panel to acknowledge: that, not the lane rate, was limiting us to ~7 MB/s. Pixels are written without ACK,
@@ -361,14 +369,16 @@ static void dsi_pixels_packet(uint8_t cmd, const uint16_t *src, int npx)
     MIPI_DSI_HOST.gen_hdr.val = 0x39u | ((wc & 0xFF) << 8) | ((wc >> 8) << 16);   // DCS long write, VC 0
 }
 
-// Send npx pixels to the already-selected window (CASET/RASET), RAMW then RAMWC.
+// Send pixels to the already-selected window (CASET/RASET): dsi_begin() then any number of dsi_pixels() calls
+// (the first packet is RAMW 0x2C, all the others RAMWC 0x3C).
+static uint8_t s_dsi_cmd = 0x2C;
+static void dsi_begin(void) { s_dsi_cmd = 0x2C; }
 static void dsi_pixels(const uint16_t *src, int npx)
 {
-    uint8_t cmd = 0x2C;
     while (npx > 0) {
         int n = npx < FAST_PKT_PX ? npx : FAST_PKT_PX;
-        dsi_pixels_packet(cmd, src, n);
-        cmd = 0x3C;
+        dsi_pixels_packet(s_dsi_cmd, src, n);
+        s_dsi_cmd = 0x3C;
         src += n;
         npx -= n;
     }
@@ -394,13 +404,22 @@ static void lvgl_round_cb(lv_event_t *e)
 static volatile int64_t g_fl_us, g_lv_us;
 static volatile int g_fl_n, g_fl_px;
 
+static uint16_t *s_shadow;          // copy of what LVGL last rendered (the current screen), RGB565, PSRAM
+static bool s_capture;              // true: flush only fills s_shadow, nothing is sent to the panel
+
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     int64_t t0 = esp_timer_get_time();
-    esp_err_t err = set_window(area->x1, area->y1, area->x2, area->y2);
-    int npx = (area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
-    if (err == ESP_OK) dsi_pixels((const uint16_t *)px_map, npx);
-    else ESP_LOGE(TAG, "flush failed: %s", esp_err_to_name(err));
+    int w = area->x2 - area->x1 + 1, h = area->y2 - area->y1 + 1, npx = w * h;
+    if (s_shadow) {
+        for (int y = 0; y < h; y++)
+            memcpy(s_shadow + (area->y1 + y) * LCD_H + area->x1, px_map + y * w * 2, w * 2);
+    }
+    if (!s_capture) {
+        esp_err_t err = set_window(area->x1, area->y1, area->x2, area->y2);
+        if (err == ESP_OK) { dsi_begin(); dsi_pixels((const uint16_t *)px_map, npx); }
+        else ESP_LOGE(TAG, "flush failed: %s", esp_err_to_name(err));
+    }
     g_fl_us += esp_timer_get_time() - t0;
     if (g_dsi_to) {
         static int rep;
@@ -412,11 +431,14 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     lv_display_flush_ready(disp);
 }
 
-static uint32_t lvgl_tick_cb(void) { return xTaskGetTickCount() * portTICK_PERIOD_MS; }
+static uint32_t lvgl_tick_cb(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+
+static void nav_poll(void);
 
 static void lvgl_task(void *arg)
 {
     for (;;) {
+        nav_poll();
         int64_t t0 = esp_timer_get_time();
         uint32_t wait_ms = lv_timer_handler();
         g_lv_us += esp_timer_get_time() - t0;
@@ -867,9 +889,9 @@ static int s_cal_neg, s_cal_fill, s_cal_v = 1 << 30;      // direction, filled d
 
 static lv_color_t caliper_col(int neg, int dist_deg)        // colour at a distance from the top, in degrees
 {
-    return lv_color_mix(lv_color_hex(neg ? CAL_NEG_DARK : CAL_POS_DARK),
-                        lv_color_hex(neg ? CAL_NEG_LIGHT : CAL_POS_LIGHT),
-                        (uint8_t)(dist_deg * 255 / 360));
+    return lv_color_mix(lv_color_hex(neg ? CAL_NEG_LIGHT : CAL_POS_LIGHT),     // dark at 0 mm, light at +-150 mm
+                        lv_color_hex(neg ? CAL_NEG_DARK : CAL_POS_DARK),
+                        (uint8_t)((90 + dist_deg * 3 / 4) * 255 / 360));   // starts at the former 1/4 colour (not too dark)
 }
 
 static void caliper_pt(const lv_area_t *c, int deg, int *x, int *y)   // point on the ring centre line
@@ -984,6 +1006,147 @@ static void caliper_demo_cb(lv_timer_t *t)  // fake measurement sweeping 0 -> +1
     caliper_set_mm100((int)(sinf(ph) * CALIPER_MAX_MM * 100));
 }
 
+// ---- Battery: 1S LiPo on GPIO23 (BAT_ADC) through a 200k/200k divider; icon with 5 invisible 20 % steps ----
+#define PIN_BAT_ADC      GPIO_NUM_23
+#define BAT_DIV          2.0f       // two equal resistors: the pin sees Vbat / 2
+#define BAT_LOW_PCT      20         // icon turns red below this
+static adc_oneshot_unit_handle_t s_adc;
+static adc_cali_handle_t s_adc_cali;
+static adc_channel_t s_bat_ch;
+static lv_obj_t *s_bat_body, *s_bat_nub, *s_bat_fill;
+static float s_bat_v;               // filtered battery voltage
+static int s_bat_level = -1, s_bat_red = -1;
+#define BAT_W 44                    // icon geometry (px)
+#define BAT_H 22
+#define BAT_PAD 3
+
+static int bat_percent(float v)     // typical 1S LiPo discharge curve
+{
+    static const float tv[] = { 3.27f, 3.61f, 3.69f, 3.71f, 3.73f, 3.75f, 3.77f, 3.79f, 3.80f, 3.82f, 3.84f,
+                                3.85f, 3.87f, 3.91f, 3.95f, 3.98f, 4.02f, 4.08f, 4.11f, 4.15f, 4.20f };
+    static const int tp[] = { 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100 };
+    const int n = sizeof(tv) / sizeof(tv[0]);
+    if (v <= tv[0]) return 0;
+    if (v >= tv[n - 1]) return 100;
+    for (int i = 1; i < n; i++)
+        if (v <= tv[i]) return tp[i - 1] + (int)((v - tv[i - 1]) / (tv[i] - tv[i - 1]) * (tp[i] - tp[i - 1]));
+    return 100;
+}
+
+static void bat_adc_init(void)
+{
+    adc_unit_t unit;
+    if (adc_oneshot_io_to_channel(PIN_BAT_ADC, &unit, &s_bat_ch) != ESP_OK) { cdc_log("battery: GPIO23 is not an ADC pin"); return; }
+    adc_oneshot_unit_init_cfg_t uc = { .unit_id = unit };
+    if (adc_oneshot_new_unit(&uc, &s_adc) != ESP_OK) { cdc_log("battery: ADC init failed"); s_adc = NULL; return; }
+    adc_oneshot_chan_cfg_t cc = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
+    adc_oneshot_config_channel(s_adc, s_bat_ch, &cc);
+    adc_cali_curve_fitting_config_t cf = { .unit_id = unit, .chan = s_bat_ch, .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
+    if (adc_cali_create_scheme_curve_fitting(&cf, &s_adc_cali) != ESP_OK) { s_adc_cali = NULL; cdc_log("battery: no ADC calibration, using raw scale"); }
+}
+
+static float bat_read_volts(void)    // average of 32 samples
+{
+    if (!s_adc) return 0;
+    long sum = 0;
+    int n = 0;
+    for (int i = 0; i < 32; i++) {
+        int raw;
+        if (adc_oneshot_read(s_adc, s_bat_ch, &raw) == ESP_OK) { sum += raw; n++; }
+    }
+    if (!n) return 0;
+    int raw = (int)(sum / n), mv;
+    if (!s_adc_cali || adc_cali_raw_to_voltage(s_adc_cali, raw, &mv) != ESP_OK) mv = raw * 3300 / 4095;
+    return (float)mv * 0.001f * BAT_DIV;
+}
+
+static lv_obj_t *s_bat_bolt;
+static int s_bat_chg = -1;
+
+// Show a battery state: pct 0..100 in 5 invisible steps of 20 %, red at 20 % or less, green with a bolt while charging.
+static void bat_apply(int pct, int charging)
+{
+    int level = charging ? 5 : (pct + 10) / 20;
+    int red = !charging && pct <= BAT_LOW_PCT;
+    if (level == s_bat_level && red == s_bat_red && charging == s_bat_chg) return;
+    s_bat_level = level;
+    s_bat_red = red;
+    s_bat_chg = charging;
+    lv_color_t col = charging ? lv_color_hex(0x2E9E58) : red ? lv_color_hex(0xC04444) : lv_color_hex(0x707070);   // muted: stays in the background
+    lv_obj_set_style_border_color(s_bat_body, col, 0);
+    lv_obj_set_style_bg_color(s_bat_nub, col, 0);
+    lv_obj_set_style_bg_color(s_bat_fill, col, 0);
+    int inner = BAT_W - 2 * BAT_PAD - 4;                    // fill area inside the 2 px border
+    lv_obj_set_width(s_bat_fill, level * inner / 5);
+    lv_obj_set_style_bg_opa(s_bat_fill, level ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    if (charging) lv_obj_remove_flag(s_bat_bolt, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(s_bat_bolt, LV_OBJ_FLAG_HIDDEN);
+}
+
+#define BAT_SIM 1       // 1: slowly cycle charging, 100, 80, 60, 40, 20 % (demo); 0: show the real battery
+
+static void bat_sim_cb(lv_timer_t *t)
+{
+    (void)t;
+    static const int pct[] = { -1, 100, 80, 60, 40, 20 };    // -1 = charging
+    static int i;
+    bat_apply(pct[i] < 0 ? 0 : pct[i], pct[i] < 0);
+    i = (i + 1) % (int)(sizeof(pct) / sizeof(pct[0]));
+}
+
+static void bat_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    float v = bat_read_volts();
+    if (v < 1.0f) return;                                   // nothing connected / ADC failed
+    s_bat_v = s_bat_v < 1.0f ? v : s_bat_v * 0.8f + v * 0.2f;
+    int pct = bat_percent(s_bat_v);
+    static int last_log;
+    if (++last_log >= 5) { last_log = 0; cdc_log("battery: %.2f V -> %d %%", s_bat_v, pct); }
+#if !BAT_SIM
+    bat_apply(pct, 0);
+#endif
+}
+
+static void battery_create(lv_obj_t *scr)
+{
+    s_bat_body = lv_obj_create(scr);
+    lv_obj_set_size(s_bat_body, BAT_W, BAT_H);
+    lv_obj_align(s_bat_body, LV_ALIGN_CENTER, -2, 118);
+    lv_obj_set_style_bg_opa(s_bat_body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_bat_body, 2, 0);
+    lv_obj_set_style_radius(s_bat_body, 5, 0);
+    lv_obj_set_style_pad_all(s_bat_body, 0, 0);
+    lv_obj_remove_flag(s_bat_body, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    s_bat_nub = lv_obj_create(scr);
+    lv_obj_set_size(s_bat_nub, 4, 10);
+    lv_obj_align_to(s_bat_nub, s_bat_body, LV_ALIGN_OUT_RIGHT_MID, 1, 0);
+    lv_obj_set_style_border_width(s_bat_nub, 0, 0);
+    lv_obj_set_style_radius(s_bat_nub, 2, 0);
+    lv_obj_remove_flag(s_bat_nub, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    s_bat_fill = lv_obj_create(s_bat_body);
+    lv_obj_set_height(s_bat_fill, BAT_H - 2 * BAT_PAD - 4);
+    lv_obj_set_width(s_bat_fill, 0);
+    lv_obj_align(s_bat_fill, LV_ALIGN_LEFT_MID, BAT_PAD - 1, 0);
+    lv_obj_set_style_border_width(s_bat_fill, 0, 0);
+    lv_obj_set_style_radius(s_bat_fill, 2, 0);
+    lv_obj_set_style_pad_all(s_bat_fill, 0, 0);
+    lv_obj_remove_flag(s_bat_fill, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    s_bat_bolt = lv_label_create(s_bat_body);
+    lv_label_set_text(s_bat_bolt, LV_SYMBOL_CHARGE);
+    lv_obj_set_style_text_font(s_bat_bolt, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_bat_bolt, lv_color_black(), 0);
+    lv_obj_center(s_bat_bolt);
+    lv_obj_add_flag(s_bat_bolt, LV_OBJ_FLAG_HIDDEN);
+    bat_adc_init();
+    bat_timer_cb(NULL);
+    lv_timer_create(bat_timer_cb, 1000, NULL);
+#if BAT_SIM
+    bat_sim_cb(NULL);
+    lv_timer_create(bat_sim_cb, 2500, NULL);
+#endif
+}
+
 static lv_obj_t *caliper_create(void)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
@@ -1009,41 +1172,33 @@ static lv_obj_t *caliper_create(void)
     s_cal_unit = lv_label_create(scr);
     lv_label_set_text(s_cal_unit, "mm");
     lv_obj_set_style_text_font(s_cal_unit, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(s_cal_unit, lv_color_white(), 0);
+    lv_obj_set_style_text_color(s_cal_unit, lv_color_hex(0x7A7A7A), 0);
     lv_obj_align(s_cal_unit, LV_ALIGN_CENTER, 0, 75);
+
+    battery_create(scr);
 
     caliper_set_mm100(0);
     lv_timer_create(caliper_demo_cb, 33, NULL);
     return scr;
 }
 
-// ---- 4-way swipe navigation: the gauge is home, each direction slides to a (for now empty) menu ----
-typedef struct { lv_obj_t *dest; lv_screen_load_anim_t anim; } nav_link_t;
-#define NAV_ANIM_MS 380
+// ---- 4-way swipe navigation: the finger drags the next screen in; pre-rendered images, no LVGL redraw ----
+// The home screen (gauge) is rendered by LVGL as usual (and mirrored into s_shadow by the flush callback). The four
+// menus are rendered ONCE into PSRAM images. While the finger drags, and during the spring that finishes the move,
+// each frame is composed straight from those images into the panel's GRAM: no rendering, only PSRAM reads and DSI.
+// The incoming screen slides over the outgoing one, which moves more slowly (parallax).
+enum { D_LEFT, D_RIGHT, D_UP, D_DOWN };       // swipe direction; menu d is reached by swiping d
+#define NAV_PARALLAX  0.30f
+#define NAV_START_PX  14
+#define IMG_BYTES     (LCD_H * LCD_V * 2)
+#define PIN_TE        GPIO_NUM_13
 
-static int nav_dir_idx(lv_dir_t d)
-{
-    switch (d) {
-    case LV_DIR_LEFT:   return 0;
-    case LV_DIR_RIGHT:  return 1;
-    case LV_DIR_TOP:    return 2;
-    case LV_DIR_BOTTOM: return 3;
-    default:            return -1;
-    }
-}
-
-static void nav_gesture_cb(lv_event_t *e)
-{
-    static uint32_t last;
-    lv_obj_t *scr = lv_event_get_current_target_obj(e);
-    int dir = nav_dir_idx(lv_indev_get_gesture_dir(lv_indev_active()));
-    uint32_t now = lv_tick_get();
-    if (dir < 0 || now - last < NAV_ANIM_MS + 80) return;          // ignore while an animation is running
-    nav_link_t *l = (nav_link_t *)lv_obj_get_user_data(scr);
-    if (!l || !l[dir].dest) return;
-    last = now;
-    lv_screen_load_anim(l[dir].dest, l[dir].anim, NAV_ANIM_MS, 0, false);
-}
+static uint16_t *s_menu_img[4], *s_home_img;
+static lv_obj_t *s_home_scr, *s_menu_scr[4];
+static int s_cur = -1;                         // -1 = home, 0..3 = menu d
+static bool s_te_ok;
+static uint16_t s_row[LCD_H] __attribute__((aligned(4)));
+static int g_nav_frames, g_nav_us;
 
 static lv_obj_t *nav_menu_create(const char *title, const char *arrow, uint32_t col)
 {
@@ -1066,30 +1221,178 @@ static lv_obj_t *nav_menu_create(const char *title, const char *arrow, uint32_t 
     return scr;
 }
 
+static void te_probe(void)
+{
+    gpio_config_t te = { .pin_bit_mask = 1ULL << PIN_TE, .mode = GPIO_MODE_INPUT };
+    gpio_config(&te);
+    int64_t t0 = esp_timer_get_time(), first = 0, last = 0;
+    int edges = 0, prev = gpio_get_level(PIN_TE);
+    while (esp_timer_get_time() - t0 < 200000) {
+        int l = gpio_get_level(PIN_TE);
+        if (l && !prev) {
+            int64_t t = esp_timer_get_time();
+            if (!edges) first = t;
+            last = t;
+            edges++;
+        }
+        prev = l;
+    }
+    s_te_ok = edges >= 3;
+    cdc_log("TE: %d rising edges in 200 ms%s", edges, s_te_ok ? "" : " (no tearing sync)");
+    if (s_te_ok) cdc_log("TE period %d us", (int)((last - first) / (edges - 1)));
+}
+
+static void te_wait(void)                      // start the frame right after the panel's vertical sync
+{
+    if (!s_te_ok) return;
+    int64_t t0 = esp_timer_get_time();
+    while (gpio_get_level(PIN_TE)) if (esp_timer_get_time() - t0 > 30000) return;
+    while (!gpio_get_level(PIN_TE)) if (esp_timer_get_time() - t0 > 30000) return;
+}
+
+// One frame: the incoming image B has travelled o pixels over the outgoing image A in direction dir.
+static void nav_frame(const uint16_t *A, const uint16_t *B, int dir, int o)
+{
+    if (o < 0) o = 0;
+    if (o > LCD_H) o = LCD_H;
+    int ao = (int)((float)o * NAV_PARALLAX);
+    te_wait();
+    int64_t t0 = esp_timer_get_time();
+    set_window(0, 0, LCD_H - 1, LCD_V - 1);
+    dsi_begin();
+    for (int y = 0; y < LCD_V; y++) {
+        const uint16_t *src;
+        const uint16_t *a = A + y * LCD_H, *b = B + y * LCD_H;
+        switch (dir) {
+        case D_LEFT:
+            memcpy(s_row, a + ao, (LCD_H - o) * 2);
+            memcpy(s_row + (LCD_H - o), b, o * 2);
+            src = s_row;
+            break;
+        case D_RIGHT:
+            memcpy(s_row, b + (LCD_H - o), o * 2);
+            memcpy(s_row + o, a + (o - ao), (LCD_H - o) * 2);
+            src = s_row;
+            break;
+        case D_UP:
+            src = (y < LCD_V - o) ? A + (y + ao) * LCD_H : B + (y - (LCD_V - o)) * LCD_H;
+            break;
+        default: // D_DOWN
+            src = (y < o) ? B + (LCD_V - o + y) * LCD_H : A + (y - ao) * LCD_H;
+            break;
+        }
+        dsi_pixels(src, LCD_H);
+    }
+    g_nav_us += (int)(esp_timer_get_time() - t0);
+    g_nav_frames++;
+}
+
+static int nav_progress(int dir, int x0, int y0)     // finger travel along the swipe direction
+{
+    int p = dir == D_LEFT ? x0 - s_tx : dir == D_RIGHT ? s_tx - x0 : dir == D_UP ? y0 - s_ty : s_ty - y0;
+    return p < 0 ? 0 : (p > LCD_H ? LCD_H : p);
+}
+
+// Drag + release spring. Returns true if the move completed (the other screen is now current).
+static bool nav_run(int dir, int x0, int y0)
+{
+    const uint16_t *A = s_cur < 0 ? s_shadow : s_menu_img[s_cur];
+    const uint16_t *B = s_cur < 0 ? s_menu_img[dir] : s_home_img;
+    float o = 0, v = 0;
+    int64_t tp = esp_timer_get_time();
+    // 1. the finger drags (the displayed offset chases the finger a little behind it: smooth)
+    while (s_tpress) {
+        touch_poll();
+        int64_t tn = esp_timer_get_time();
+        float dt = (float)(tn - tp) * 1e-6f;
+        tp = tn;
+        float target = (float)nav_progress(dir, x0, y0), prev = o;
+        o += (target - o) * (1.0f - expf(-dt / 0.035f));
+        if (dt > 0) v = 0.7f * v + 0.3f * (o - prev) / dt;
+        nav_frame(A, B, dir, (int)(o + 0.5f));
+        taskYIELD();
+    }
+    // 2. released: critically damped spring to the end (or back), keeping the speed of the finger
+    bool done = o > 0.40f * LCD_H || v > 500.0f;
+    if (v < -500.0f) done = false;
+    float T = done ? (float)LCD_H : 0.0f;
+    const float w = 15.0f;
+    tp = esp_timer_get_time();
+    for (;;) {
+        int64_t tn = esp_timer_get_time();
+        float dt = (float)(tn - tp) * 1e-6f;
+        if (dt > 0.04f) dt = 0.04f;
+        tp = tn;
+        float acc = -w * w * (o - T) - 2.0f * w * v;
+        v += acc * dt;
+        o += v * dt;
+        if (o > LCD_H) { o = LCD_H; if (v > 0) v = 0; }
+        if (o < 0) { o = 0; if (v < 0) v = 0; }
+        bool settled = fabsf(o - T) < 0.6f && fabsf(v) < 10.0f;
+        nav_frame(A, B, dir, settled ? (int)T : (int)(o + 0.5f));
+        if (settled) break;
+        taskYIELD();
+    }
+    return done;
+}
+
+// Called from the LVGL task: starts a drag when the finger moved enough in an allowed direction.
+static void nav_poll(void)
+{
+    static bool was;
+    static int x0, y0;
+    touch_poll();
+    if (s_tpress && !was) { x0 = s_tx; y0 = s_ty; }
+    was = s_tpress;
+    if (!s_tpress || !s_shadow) return;
+    int dx = s_tx - x0, dy = s_ty - y0, dir;
+    if (LV_ABS(dx) >= LV_ABS(dy) && LV_ABS(dx) > NAV_START_PX) dir = dx < 0 ? D_LEFT : D_RIGHT;
+    else if (LV_ABS(dy) > LV_ABS(dx) && LV_ABS(dy) > NAV_START_PX) dir = dy < 0 ? D_UP : D_DOWN;
+    else return;
+    if (s_cur >= 0 && dir != (s_cur ^ 1)) return;           // in a menu: only the way back
+    int from = s_cur;
+    if (nav_run(dir, x0, y0)) {
+        if (from < 0) {
+            memcpy(s_home_img, s_shadow, IMG_BYTES);
+            s_cur = dir;
+            lv_screen_load(s_menu_scr[dir]);
+        } else {
+            s_cur = -1;
+            lv_screen_load(s_home_scr);
+        }
+        lv_obj_invalidate(lv_screen_active());               // LVGL redraws the same picture: nothing visible changes
+    }
+    was = s_tpress;
+    cdc_log("nav: %d frames, avg %d us/frame", g_nav_frames, g_nav_frames ? g_nav_us / g_nav_frames : 0);
+    g_nav_frames = g_nav_us = 0;
+}
+
 static void nav_init(lv_obj_t *home)
 {
-    // menus: swiping the opposite way comes back
-    lv_obj_t *mr = nav_menu_create("MENU DROITE", LV_SYMBOL_RIGHT, 0x1E6FD9);
-    lv_obj_t *ml = nav_menu_create("MENU GAUCHE", LV_SYMBOL_LEFT, 0x8A2BE2);
-    lv_obj_t *mb = nav_menu_create("MENU BAS", LV_SYMBOL_DOWN, 0x1FA855);
-    lv_obj_t *mt = nav_menu_create("MENU HAUT", LV_SYMBOL_UP, 0xE0801A);
-    static nav_link_t home_l[4], mr_l[4], ml_l[4], mb_l[4], mt_l[4];
-    // index: 0 = swipe LEFT, 1 = RIGHT, 2 = UP, 3 = DOWN
-    home_l[0] = (nav_link_t){mr, LV_SCREEN_LOAD_ANIM_MOVE_LEFT};
-    home_l[1] = (nav_link_t){ml, LV_SCREEN_LOAD_ANIM_MOVE_RIGHT};
-    home_l[2] = (nav_link_t){mb, LV_SCREEN_LOAD_ANIM_MOVE_TOP};
-    home_l[3] = (nav_link_t){mt, LV_SCREEN_LOAD_ANIM_MOVE_BOTTOM};
-    mr_l[1] = (nav_link_t){home, LV_SCREEN_LOAD_ANIM_MOVE_RIGHT};
-    ml_l[0] = (nav_link_t){home, LV_SCREEN_LOAD_ANIM_MOVE_LEFT};
-    mb_l[3] = (nav_link_t){home, LV_SCREEN_LOAD_ANIM_MOVE_BOTTOM};
-    mt_l[2] = (nav_link_t){home, LV_SCREEN_LOAD_ANIM_MOVE_TOP};
-    lv_obj_t *scr[5] = {home, mr, ml, mb, mt};
-    nav_link_t *lk[5] = {home_l, mr_l, ml_l, mb_l, mt_l};
-    for (int i = 0; i < 5; i++) {
-        lv_obj_set_user_data(scr[i], lk[i]);
-        lv_obj_add_event_cb(scr[i], nav_gesture_cb, LV_EVENT_GESTURE, NULL);
+    s_shadow = heap_caps_aligned_alloc(64, IMG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_home_img = heap_caps_aligned_alloc(64, IMG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    for (int i = 0; i < 4; i++) s_menu_img[i] = heap_caps_aligned_alloc(64, IMG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_shadow || !s_home_img || !s_menu_img[0] || !s_menu_img[1] || !s_menu_img[2] || !s_menu_img[3]) {
+        cdc_log("nav: no PSRAM for the screen images, swipe disabled");
+        s_shadow = NULL;
+        lv_screen_load(home);
+        return;
     }
+    s_home_scr = home;
+    s_menu_scr[D_LEFT] = nav_menu_create("MENU DROITE", LV_SYMBOL_RIGHT, 0x1E6FD9);   // reached by swiping left
+    s_menu_scr[D_RIGHT] = nav_menu_create("MENU GAUCHE", LV_SYMBOL_LEFT, 0x8A2BE2);
+    s_menu_scr[D_UP] = nav_menu_create("MENU BAS", LV_SYMBOL_DOWN, 0x1FA855);
+    s_menu_scr[D_DOWN] = nav_menu_create("MENU HAUT", LV_SYMBOL_UP, 0xE0801A);
+    s_capture = true;                                                   // render each menu once, into its image
+    for (int i = 0; i < 4; i++) {
+        lv_screen_load(s_menu_scr[i]);
+        lv_obj_invalidate(s_menu_scr[i]);
+        lv_refr_now(NULL);
+        memcpy(s_menu_img[i], s_shadow, IMG_BYTES);
+    }
+    s_capture = false;
     lv_screen_load(home);
+    cdc_log("nav: screens ready, PSRAM free %u KB", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 }
 
 void app_main(void)
@@ -1127,6 +1430,7 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(1000));   // let the panel-side supplies settle before resetting the touch chip
     touch_init();
 
+    te_probe();
 #if !USE_LVGL
     hw_test_run();   // never returns
     return;
@@ -1163,4 +1467,8 @@ void app_main(void)
 #endif
     xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 4, NULL);
     cdc_log("LVGL %d.%d.%d running", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
+#if C2_PROBE
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    c2_probe();   // read-only test of the ESP8684 link (see c2.c)
+#endif
 }
