@@ -1,4 +1,4 @@
-# --- LVGL Pro Editor project -----------------------------------------------------------
+﻿# --- LVGL Pro Editor project -----------------------------------------------------------
 # Create/open the editor project in ../ui (project name: esp32p4_ui) and export the C code into
 # that same folder: every .c file below ../ui is compiled into this component, and every folder
 # that contains a header is added to the include path (run `idf.py reconfigure` after the first export). Without an export the built-in demo UI is used.
@@ -15,9 +15,9 @@ foreach(h ${UI_HDRS})
 endforeach()
 list(REMOVE_DUPLICATES UI_INCLUDE_DIRS)
 
-idf_component_register(SRCS "main.c" "c2.c" ${UI_SRCS}
+idf_component_register(SRCS "main.c" "c2.c" "encoder.c" ${UI_SRCS}
                        INCLUDE_DIRS "." ${UI_INCLUDE_DIRS}
-                       EMBED_FILES "clip.bin" "value_font.ttf" REQUIRES esp_lcd esp_mm esp_driver_gpio esp_driver_i2c soc esp_system esp_timer esp_driver_uart esp_adc espressif__esp-serial-flasher lvgl__lvgl)
+                       EMBED_FILES "clip.bin" "value_font.ttf" "c2_blink.bin" REQUIRES esp_lcd esp_mm esp_driver_gpio esp_driver_i2c soc esp_system esp_timer esp_driver_uart esp_driver_ledc esp_driver_pcnt esp_adc espressif__esp-serial-flasher lvgl__lvgl)
 
 # the generated code includes "lvgl.h"
 if(COMPONENT_LIB)

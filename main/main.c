@@ -1,4 +1,4 @@
-// ESP32-P4 / CH13613 466x466 MIPI-DSI test: full-screen red / green / blue in sequence,
+﻿// ESP32-P4 / CH13613 466x466 MIPI-DSI test: full-screen red / green / blue in sequence,
 // written into the panel's own GRAM with DCS RAMW/RAMWC (DSI command mode).
 // The DPI video path of the P4 stalls after one frame with this panel, so it is not used.
 // + TinyUSB CDC ACM with "1200 baud => ROM download mode" auto-reset, and logs over CDC.
@@ -314,10 +314,16 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     data->state = s_tpress ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
-// ESP8684 link test (c2.c). Result so far: GPIO8 of the ESP8684 reads low, so it cannot enter download mode
-// (needs a pull-up on GPIO8): leave it off until the hardware is fixed.
+// ESP8684 link test / programming (c2.c). GPIO8 of the ESP8684 now has a pull-up (download mode needs GPIO8=1, GPIO9=0).
+// C2_PROBE 1 runs it once at boot; C2_FLASH 1 also flashes c2_blink.bin (LED on GPIO18) and runs it.
+// Done once (blinky flashed and verified): left off so the C2 is not reflashed at every boot.
 #define C2_PROBE 0
-void c2_probe(void);
+#define C2_FLASH 1
+void c2_probe(int flash);
+void c2_run(void);
+void power_boot(void);
+void encoder_init(void);
+int encoder_mm100(void);   // AS5311 position in 1/100 mm since the last zero (encoder.c)
 
 // ---- Fast pixel path ----------------------------------------------------------------
 // The IDF DBI driver enables command ACK, so after EVERY packet the host turns the bus around (BTA) and waits for
@@ -435,9 +441,12 @@ static uint32_t lvgl_tick_cb(void) { return (uint32_t)(esp_timer_get_time() / 10
 
 static void nav_poll(void);
 
+volatile int g_lvgl_pause;   // set by c2.c while it flashes the ESP8684 (the UI stays frozen, the P4 crashed when both ran)
+
 static void lvgl_task(void *arg)
 {
     for (;;) {
+        if (g_lvgl_pause) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
         nav_poll();
         int64_t t0 = esp_timer_get_time();
         uint32_t wait_ms = lv_timer_handler();
@@ -885,6 +894,8 @@ static void video_button_create(lv_obj_t *scr)
 extern const uint8_t value_font_start[] asm("_binary_value_font_ttf_start");
 extern const uint8_t value_font_end[] asm("_binary_value_font_ttf_end");
 static lv_obj_t *s_cal_gauge, *s_cal_val, *s_cal_unit;
+volatile int g_unit_inch;   // 0 = mm, 1 = inch: toggled by a short press of the power-on switch (c2.c)
+static int s_cal_inch = -1;
 static int s_cal_neg, s_cal_fill, s_cal_v = 1 << 30;      // direction, filled degrees from the top
 
 static lv_color_t caliper_col(int neg, int dist_deg)        // colour at a distance from the top, in degrees
@@ -993,22 +1004,36 @@ static void caliper_set_mm100(int v)       // v in 1/100 mm, -15000..15000
             caliper_inv(neg ? 360 - hi : lo, neg ? 360 - lo : hi);
         }
     }
-    if (v != s_cal_v) {
+    int inch = g_unit_inch;
+    if (v != s_cal_v || inch != s_cal_inch) {
         s_cal_v = v;
-        lv_label_set_text_fmt(s_cal_val, "%s%d.%02d", neg ? "-" : "", a / 100, a % 100);
+        if (inch != s_cal_inch) lv_label_set_text(s_cal_unit, inch ? "in" : "mm");
+        s_cal_inch = inch;
+        if (inch) {                                               // 1/100 mm -> 1/1000 inch (25.4 mm per inch)
+            int mi = (a * 100 + 127) / 254;
+            lv_label_set_text_fmt(s_cal_val, "%s%d.%03d", neg ? "-" : "", mi / 1000, mi % 1000);
+        } else {
+            lv_label_set_text_fmt(s_cal_val, "%s%d.%02d", neg ? "-" : "", a / 100, a % 100);
+        }
     }
 }
 
-static void caliper_demo_cb(lv_timer_t *t)  // fake measurement sweeping 0 -> +150 -> 0 -> -150 -> 0 mm, 24 s per cycle
+#define CALIPER_DEMO 0   // 1: fake measurement sweeping 0 -> +150 -> 0 -> -150 -> 0 mm, 24 s per cycle; 0: real AS5311 reading
+static void caliper_demo_cb(lv_timer_t *t)
 {
     (void)t;
+#if CALIPER_DEMO
     float ph = (float)lv_tick_get() / 24000.0f * 2.0f * (float)M_PI;
     caliper_set_mm100((int)(sinf(ph) * CALIPER_MAX_MM * 100));
+#else
+    caliper_set_mm100(encoder_mm100());
+#endif
 }
 
 // ---- Battery: 1S LiPo on GPIO23 (BAT_ADC) through a 200k/200k divider; icon with 5 invisible 20 % steps ----
 #define PIN_BAT_ADC      GPIO_NUM_23
 #define BAT_DIV          2.0f       // two equal resistors: the pin sees Vbat / 2
+#define BAT_CAL          1.0f       // calibration factor: (multimeter volts at +BATT) / (volts printed in the "battery:" log)
 #define BAT_LOW_PCT      20         // icon turns red below this
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_adc_cali;
@@ -1057,7 +1082,7 @@ static float bat_read_volts(void)    // average of 32 samples
     if (!n) return 0;
     int raw = (int)(sum / n), mv;
     if (!s_adc_cali || adc_cali_raw_to_voltage(s_adc_cali, raw, &mv) != ESP_OK) mv = raw * 3300 / 4095;
-    return (float)mv * 0.001f * BAT_DIV;
+    return (float)mv * 0.001f * BAT_DIV * BAT_CAL;
 }
 
 static lv_obj_t *s_bat_bolt;
@@ -1083,7 +1108,7 @@ static void bat_apply(int pct, int charging)
     else lv_obj_add_flag(s_bat_bolt, LV_OBJ_FLAG_HIDDEN);
 }
 
-#define BAT_SIM 1       // 1: slowly cycle charging, 100, 80, 60, 40, 20 % (demo); 0: show the real battery
+#define BAT_SIM 0       // 1: slowly cycle charging, 100, 80, 60, 40, 20 % (demo); 0: show the real battery
 
 static void bat_sim_cb(lv_timer_t *t)
 {
@@ -1395,15 +1420,42 @@ static void nav_init(lv_obj_t *home)
     cdc_log("nav: screens ready, PSRAM free %u KB", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 }
 
+// Heartbeat: the activity LED toggles at 2 Hz as long as FreeRTOS is alive (independent of the display).
+static void heartbeat_task(void *arg)
+{
+    for (int on = 1;; on ^= 1) {
+        gpio_set_level(PIN_LED, on);
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
+// ESP8684 handling in its own task, started before the LCD so a display stall cannot block it.
+static void c2_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    // 1 power-on, 3 software, 4 panic, 5 interrupt WDT, 6 task WDT, 7 other WDT, 9 brownout
+    cdc_log("reset reason: %d", (int)esp_reset_reason());
+#if C2_PROBE
+    c2_probe(C2_FLASH);   // test of the ESP8684 link (see c2.c); C2_FLASH 1 also flashes the c2_blink image
+#else
+    c2_run();             // release the ESP8684 so it boots its own firmware from flash
+#endif
+    vTaskDelete(NULL);
+}
+
 void app_main(void)
 {
     gpio_config_t led = { .pin_bit_mask = 1ULL << PIN_LED, .mode = GPIO_MODE_OUTPUT };
     gpio_config(&led);
     gpio_set_level(PIN_LED, 1);
+    xTaskCreate(heartbeat_task, "heartbeat", 2048, NULL, 10, NULL);   // above the LVGL task so it keeps blinking if the display stalls
+    power_boot();   // takes the power latch (PWR_OFF high) at once and plays the power-on tune (see c2.c)
+    encoder_init();   // AS5311 on GPIO33/37 (PCNT); needs the UART console off, see sdkconfig.defaults
 
     // USB first so a bootloader request works even if the LCD fails.
     esp_err_t err = usb_start();
     if (err != ESP_OK) ESP_LOGE(TAG, "USB init failed: %s", esp_err_to_name(err));
+    xTaskCreate(c2_task, "c2", 8192, NULL, 2, NULL);
 
     err = lcd_start();
     if (err != ESP_OK) {
@@ -1467,8 +1519,4 @@ void app_main(void)
 #endif
     xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 4, NULL);
     cdc_log("LVGL %d.%d.%d running", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
-#if C2_PROBE
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    c2_probe();   // read-only test of the ESP8684 link (see c2.c)
-#endif
 }
